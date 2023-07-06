@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+
 import cv2
 from typing import Tuple
 import random
@@ -225,22 +227,26 @@ class MetricSMPCallback(Callback):
                  mode='multiclass',
                  reduction='micro-imagewise',
                  ignore_index=None,
-                 activation='identity',  # just return input
+                 activation='identity',  # 'identity' just return input
                  n_img_check_per_epoch_validation: int = 0,
-                 n_img_check_per_epoch_train: int = 0) -> None:
+                 n_img_check_per_epoch_train: int = 0,
+                 n_img_check_per_epoch_save: bool = False,
+                 ) -> None:
         # maybe binary because each chanel is binary?
         # from torchmetrics.classification import BinaryJaccardIndex ?
         # https://torchmetrics.readthedocs.io/en/stable/classification/jaccard_index.html#jaccard-index
         self.metrics = metrics
+        self.colors = get_random_colors(80) if colors is None else colors
+
+        self.mode = mode
         self.reduction = reduction
 
         self.ignore_index = ignore_index
         self.activation = Activation(activation)
 
-        self.mode = mode
         self.n_img_check_per_epoch_validation = n_img_check_per_epoch_validation
         self.n_img_check_per_epoch_train = n_img_check_per_epoch_train
-        self.colors = get_random_colors(80) if colors is None else colors
+        self.n_img_check_per_epoch_save = n_img_check_per_epoch_save
 
     def _get_metrics(self, preds, gts):
         metric_results = {k: [] for k in self.metrics}
@@ -259,12 +265,14 @@ class MetricSMPCallback(Callback):
         return metric_results
 
     @staticmethod
-    def _get_full_color(shape, color):
+    def _get_full_color(shape, color, rgb2bgr=True):
         channels = []
         for ch in range(len(color)):
             ch_color = torch.full(shape, color[ch])
             channels.append(ch_color)
-        return torch.stack(channels[::-1], dim=0)
+        if rgb2bgr:
+            channels = channels[::-1]
+        return torch.stack(channels, dim=0)
 
     @staticmethod
     @torch.no_grad()
@@ -284,31 +292,39 @@ class MetricSMPCallback(Callback):
             img_mask_gt = img_mask_gt * (1.0 - confidences_gt) + full_color * confidences_gt
             img_mask_pred = img_mask_pred * (1.0 - confidences_pred) + full_color * confidences_pred
 
-        pred_gt_concat = torch.cat([img_mask_gt, img_mask_pred], dim=concat_dim)
+        pred_gt_concat = torch.cat([img_mask_gt, img_mask_pred], dim=concat_dim)  # concat by h or w
         pred_gt_concat = torch.permute(pred_gt_concat, (1, 2, 0))
         return pred_gt_concat.cpu().detach().numpy()
 
     def _on_shared_batch_end(self, trainer, outputs, batch, batch_idx, stage) -> None:
         imgs, gts = batch
+        loss = round(outputs['loss'], 5)
 
         preds = self.activation(outputs['preds'])
-        loss = outputs['loss']
+
         metrics = self._get_metrics(preds=preds, gts=gts)
+        # TODO: проверить подсчет метрик + разделить по каналам
         for m_name, m_val in metrics.items():
             trainer.model.log(f'{m_name}/{stage}', m_val, on_step=False, on_epoch=True)
 
         if stage in ['validation'] and batch_idx in self.batches_check_validation or \
                 stage in ['train'] and batch_idx in self.batches_check_train:
-            img_for_show = self.draw_tensor_masks(
-                imgs[0], gts[0], preds[0],
-                colors=self.colors,
-            )
+
+            save_path = None
+            if self.n_img_check_per_epoch_save:
+                logger = trainer._loggers[0].__dict__
+                # TODO: how to prettify it?
+                log_path = Path(logger["_root_dir"], logger["_name"], f'version_{logger["_version"]}')
+                save_path = log_path / 'imgs' / f'{stage}' / f'epoch={trainer.current_epoch}_batch_idx={batch_idx}.jpg'
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+
+            img_for_show = self.draw_tensor_masks(imgs[0], gts[0], preds[0], colors=self.colors)
             title = f'{stage}: epoch={trainer.current_epoch} batch_idx={batch_idx} (loss={loss})\n{metrics}'
-            plt_show_img(img_for_show, title=title, mode='plt')
+            plt_show_img(img_for_show, title=title, mode='plt', save_path=save_path)
 
     def on_train_epoch_start(self, trainer, pl_module) -> None:
         self.batches_check_train = random.sample(
-            range(0, trainer.val_check_batch),
+            range(1, trainer.val_check_batch),
             min(self.n_img_check_per_epoch_train, trainer.val_check_batch)
         )
 

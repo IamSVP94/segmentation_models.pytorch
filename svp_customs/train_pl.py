@@ -135,6 +135,7 @@ val_dataset = CustomSmokeDataset(
     classes=CLASSES, preprocessing=get_preprocessing(preprocessing_fn),
 )
 
+# window size = 512, 288
 train_loader = DataLoader(train_dataset, batch_size=24, shuffle=True, num_workers=15)
 val_loader = DataLoader(val_dataset, batch_size=24, shuffle=False, num_workers=15)
 
@@ -150,12 +151,12 @@ mode = smp.losses.MULTILABEL_MODE
 #     smp.losses.SoftBCEWithLogitsLoss(reduction='mean'),
 #     torch.nn.BCEWithLogitsLoss(reduction='mean'),
 # ]
-# criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
-criterion = torch.nn.BCEWithLogitsLoss(reduction='sum')
+criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
 
 metrics_callback = MetricSMPCallback(
     metrics={'iou': smp.metrics.iou_score, 'f1_score': smp.metrics.f1_score, },
-    n_img_check_per_epoch_validation=1, n_img_check_per_epoch_train=1,
+    n_img_check_per_epoch_validation=10, n_img_check_per_epoch_train=10,
+    n_img_check_per_epoch_save=True,
     activation='sigmoid', mode=mode, colors=colors,
 )
 
@@ -172,6 +173,7 @@ model = SmokeModel(
 )
 
 tb_logger = TensorBoardLogger('lightning_logs', name=f'{arch}_{ENCODER}_{EXPERIMENT_NAME}_model')
+
 lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
 best_iou_saver = ModelCheckpoint(
@@ -183,9 +185,9 @@ best_iou_saver = ModelCheckpoint(
 )
 
 trainer = pl.Trainer(
-    max_epochs=10,
-    logger=tb_logger, callbacks=[lr_monitor, metrics_callback, best_iou_saver],
-    accelerator='cuda', devices=-1, num_sanity_val_steps=0,
+    max_epochs=3,
+    accelerator='cuda', devices=-1, num_sanity_val_steps=0, logger=tb_logger,
+    callbacks=[lr_monitor, metrics_callback, best_iou_saver],
 )
 
 trainer.fit(
