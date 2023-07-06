@@ -1,5 +1,6 @@
 import cv2
 import albumentations as albu
+import torch
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
@@ -11,8 +12,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from clearml import Task
 
-# import os
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:<enter-size-here>"
 pl.seed_everything(2)
 
 EXPERIMENT_NAME = 'ClearML testing'
@@ -31,16 +30,12 @@ val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST
 # TRAIN
 arch = 'FPN'
 ENCODER = 'inceptionv4'  # исходный
-# ENCODER = "resnet101"  #
-# ENCODER = "resnext101_32x4d"  # это трансформер
 
 ENCODER_WEIGHTS = 'imagenet'
-CLASSES = ['smoke_cat_1', 'smoke_cat_2']
+CLASSES = ['smoke_cat_1', 'smoke_cat_2']  # 2 classes + 1 background
+colors = [(0, 0, 255), (0, 255, 0)]
 
-# "sigmoid”, “softmax”, “logsoftmax”, “tanh”, “identity"
-# ACTIVATION = 'softmax2d'  # could be None for logits or 'softmax2d' for multicalss segmentation
 ACTIVATION = None  # could be None for logits or 'softmax2d' for multicalss segmentation
-# TODO: активация без softmax! Потому что между каналами независимые классы!
 
 # input_width, input_height = 1920, 1088
 # input_width, input_height = 1280, 736
@@ -143,23 +138,25 @@ val_dataset = CustomSmokeDataset(
 train_loader = DataLoader(train_dataset, batch_size=24, shuffle=True, num_workers=15)
 val_loader = DataLoader(val_dataset, batch_size=24, shuffle=False, num_workers=15)
 
-# loss = smp.losses.DiceLoss(smp.losses.BINARY_MODE, from_logits=True)
-# loss = smp.losses.SoftBCEWithLogitsLoss()
+# mode = smp.losses.MULTICLASS_MODE
 mode = smp.losses.MULTILABEL_MODE
+
+# from old version
+# weighted = torch.tensor([1, 10])
+# loss = smp.utils.losses.BCEWithLogitsLoss(weight=torch.reshape(weighted, (1, len(CLASSES), 1, 1)))
 
 # criterion = [
 #     smp.losses.DiceLoss(from_logits=True, log_loss=True, mode=mode, ),
 #     smp.losses.SoftBCEWithLogitsLoss(reduction='mean'),
+#     torch.nn.BCEWithLogitsLoss(reduction='mean'),
 # ]
-criterion = smp.losses.SoftBCEWithLogitsLoss(reduction='mean')
-# criterion = smp.losses.DiceLoss(from_logits=False, mode=mode, )
+# criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+criterion = torch.nn.BCEWithLogitsLoss(reduction='sum')
 
-metrics_callback = MetricSMPCallback(metrics={
-    'iou': smp.metrics.iou_score,
-    'f1_score': smp.metrics.f1_score,
-},
-    mode=mode,
-    n_img_valid_check_per_epoch=1,
+metrics_callback = MetricSMPCallback(
+    metrics={'iou': smp.metrics.iou_score, 'f1_score': smp.metrics.f1_score, },
+    n_img_check_per_epoch_validation=1, n_img_check_per_epoch_train=1,
+    activation='sigmoid', mode=mode, colors=colors,
 )
 
 start_learning_rate = 1e-3
@@ -169,7 +166,7 @@ model = SmokeModel(
     encoder_name=ENCODER,
     activation=ACTIVATION,
     loss_fn=criterion,
-    in_channels=3,
+    in_channels=3,  # RGB
     out_classes=len(CLASSES),
     start_learning_rate=start_learning_rate,
 )
@@ -185,13 +182,6 @@ best_iou_saver = ModelCheckpoint(
     filename='{epoch:02d}-{step:02d}-{"iou/validation":.4f}',
 )
 
-# n_steps, times = 60, 3  # every "n_steps" steps "times" times
-# scheduler_steps = {n_steps * (i + 1) for i in range(times)}
-# scheduler_steps.add(epochs - 10)
-# print('scheduler_steps:', scheduler_steps)
-# scheduler_steplr = torch.optim.lr_scheduler.MultiStepLR(optimizer, gamma=0.5, milestones=scheduler_steps, verbose=True)
-# scheduler_warmup = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=10, after_scheduler=scheduler_steplr)
-
 trainer = pl.Trainer(
     max_epochs=10,
     logger=tb_logger, callbacks=[lr_monitor, metrics_callback, best_iou_saver],
@@ -204,10 +194,10 @@ trainer.fit(
     val_dataloaders=val_loader,
 )
 
-# run validation dataset
 # valid_metrics = trainer.validate(model, dataloaders=val_loader, verbose=False)
 # print(113, valid_metrics)
 
+# save bst model like ONNX
 # model_path_pth = f'/home/vid/hdd/projects/PycharmProjects/open-metric-learning/temp/cashbox/oml7_{model.arch}_{epochs}_CustomLoss_{input_size[0]}x{input_size[1]}_{model.feat_dim}_distrib.pth'
 # trainer.save_checkpoint(filepath=model_path_pth, weights_only=True)  # we don't pass loaders to .fit() in DDP
 #

@@ -12,7 +12,9 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch.utils.data import Dataset
 import segmentation_models_pytorch as smp
 from torch.utils.data import Dataset as BaseDataset
-from svp_customs.utills import glob_search, prepare_img_blob, plt_show_img, get_random_color
+
+from segmentation_models_pytorch.base.modules import Activation
+from svp_customs.utills import glob_search, prepare_img_blob, plt_show_img, get_random_colors
 from albumentations.pytorch import ToTensorV2 as ToTensor
 
 
@@ -165,6 +167,9 @@ class SmokeModel(pl.LightningModule):
         image = (image - self.mean) / self.std  # need this?
         # TODO: compare blob with opencv blob
         pred = self.model(image)
+        # print(168, pred.shape)
+        # print(169, pred)
+        # exit()
         return pred
 
     def configure_optimizers(self):
@@ -192,7 +197,6 @@ class SmokeModel(pl.LightningModule):
         # - **y_pred** - torch.Tensor of shape NxCxHxW
         # - **y_true** - torch.Tensor of shape NxHxW or Nx1xHxW
 
-
         ''' list of losses
         total_loss = 0
         for loss in self.loss_fn:
@@ -200,7 +204,6 @@ class SmokeModel(pl.LightningModule):
         # '''
 
         total_loss = self.loss_fn(preds, gts)
-
 
         self.log(f'loss/{stage}', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         return {'loss': total_loss, 'preds': preds}
@@ -216,18 +219,39 @@ class SmokeModel(pl.LightningModule):
 
 
 class MetricSMPCallback(Callback):
-    def __init__(self, metrics, mode='multiclass', reduction='micro-imagewise', n_img_valid_check_per_epoch=0) -> None:
+    def __init__(self,
+                 metrics,
+                 colors=None,
+                 mode='multiclass',
+                 reduction='micro-imagewise',
+                 ignore_index=None,
+                 activation='identity',  # just return input
+                 n_img_check_per_epoch_validation: int = 0,
+                 n_img_check_per_epoch_train: int = 0) -> None:
         # maybe binary because each chanel is binary?
         # from torchmetrics.classification import BinaryJaccardIndex ?
         # https://torchmetrics.readthedocs.io/en/stable/classification/jaccard_index.html#jaccard-index
         self.metrics = metrics
-        self.mode = mode
         self.reduction = reduction
-        self.n_img_valid_check_per_epoch = n_img_valid_check_per_epoch
+
+        self.ignore_index = ignore_index
+        self.activation = Activation(activation)
+
+        self.mode = mode
+        self.n_img_check_per_epoch_validation = n_img_check_per_epoch_validation
+        self.n_img_check_per_epoch_train = n_img_check_per_epoch_train
+        self.colors = get_random_colors(80) if colors is None else colors
 
     def _get_metrics(self, preds, gts):
         metric_results = {k: [] for k in self.metrics}
-        tp, fp, fn, tn = smp.metrics.get_stats(preds.long(), gts.long(), mode=self.mode)
+        num_classes = preds.shape[1]
+
+        tp, fp, fn, tn = smp.metrics.get_stats(
+            preds.long(), gts.long(),
+            mode=self.mode,
+            num_classes=num_classes,
+            ignore_index=self.ignore_index
+        )
         # TODO: добавить возможность подсчета метрик по каналам, т.е. по классам (ignore_index?)
         for m_name, metric in self.metrics.items():
             per_image_metric = metric(tp, fp, fn, tn, reduction=self.reduction)
@@ -244,12 +268,7 @@ class MetricSMPCallback(Callback):
 
     @staticmethod
     @torch.no_grad()
-    def draw_tensor_masks(img_t, gt_mask_t, pred_mask_t, concat_dim=1):  # need for speed
-        colors = [
-            (0, 0, 255),
-            (0, 255, 0),
-            (255, 0, 0),
-        ]
+    def draw_tensor_masks(img_t, gt_mask_t, pred_mask_t, colors, concat_dim=1):  # need for speed
         device = img_t.get_device()
 
         # [-1:1]->[0:255] RGB->BGR
@@ -271,23 +290,35 @@ class MetricSMPCallback(Callback):
 
     def _on_shared_batch_end(self, trainer, outputs, batch, batch_idx, stage) -> None:
         imgs, gts = batch
-        preds = outputs['preds']
+
+        preds = self.activation(outputs['preds'])
+        loss = outputs['loss']
         metrics = self._get_metrics(preds=preds, gts=gts)
         for m_name, m_val in metrics.items():
             trainer.model.log(f'{m_name}/{stage}', m_val, on_step=False, on_epoch=True)
 
-        if stage in ['validation'] and batch_idx in self.batches_check:
-        # if stage in ['train'] and batch_idx in [0]:
-            img_for_show = self.draw_tensor_masks(imgs[0], gts[0], preds[0])
-            title = f'epoch={trainer.current_epoch} batch_idx={batch_idx}\n{metrics}'
+        if stage in ['validation'] and batch_idx in self.batches_check_validation or \
+                stage in ['train'] and batch_idx in self.batches_check_train:
+            img_for_show = self.draw_tensor_masks(
+                imgs[0], gts[0], preds[0],
+                colors=self.colors,
+            )
+            title = f'{stage}: epoch={trainer.current_epoch} batch_idx={batch_idx} (loss={loss})\n{metrics}'
             plt_show_img(img_for_show, title=title, mode='plt')
+
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        self.batches_check_train = random.sample(
+            range(0, trainer.val_check_batch),
+            min(self.n_img_check_per_epoch_train, trainer.val_check_batch)
+        )
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
         self._on_shared_batch_end(trainer, outputs, batch, batch_idx, stage='train')
 
     def on_validation_epoch_start(self, trainer, pl_module) -> None:
-        self.batches_check = random.sample(
-            range(0, trainer.val_check_batch), min(self.n_img_valid_check_per_epoch, trainer.val_check_batch)
+        self.batches_check_validation = random.sample(
+            range(0, trainer.val_check_batch),
+            min(self.n_img_check_per_epoch_validation, trainer.val_check_batch)
         )
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:

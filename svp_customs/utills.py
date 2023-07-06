@@ -10,9 +10,12 @@ from matplotlib import pyplot as plt
 from svp_customs.constants import OPENCV_CONFIG
 
 
-def get_random_color():
-    randomcolor = (random.randint(0, 150), random.randint(50, 200), random.randint(50, 200))
-    return randomcolor
+def get_random_colors(n=1):
+    colors = []
+    for i in range(n):
+        randomcolor = (random.randint(0, 150), random.randint(50, 200), random.randint(50, 200))
+        colors.append(randomcolor)
+    return colors
 
 
 def max_show_img_size_reshape(img, max_show_img_size, return_coef=False):  # h,w format
