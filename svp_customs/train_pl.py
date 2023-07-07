@@ -26,6 +26,8 @@ MODEL_VERSION = 'R10'
 # TODO: resize на стадии до разметки или при составлении папки датасета!
 train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TRAIN_DATASET/'
 val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST_DATASET/img+jsons/'
+# train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/faketrain/'
+# val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/faketest/'
 
 # TRAIN
 arch = 'FPN'
@@ -76,6 +78,7 @@ train_transform = [
     ),
 ]
 
+train_transform = []
 '''
 train_transform = [
     albu.HorizontalFlip(p=0.5),
@@ -136,11 +139,12 @@ val_dataset = CustomSmokeDataset(
 )
 
 # window size = 512, 288
-train_loader = DataLoader(train_dataset, batch_size=24, shuffle=True, num_workers=15)
+train_loader = DataLoader(train_dataset, batch_size=20, shuffle=True, num_workers=15)
 val_loader = DataLoader(val_dataset, batch_size=24, shuffle=False, num_workers=15)
 
+# mode = smp.losses.MULTILABEL_MODE
 # mode = smp.losses.MULTICLASS_MODE
-mode = smp.losses.MULTILABEL_MODE
+mode = smp.losses.BINARY_MODE
 
 # from old version
 # weighted = torch.tensor([1, 10])
@@ -154,10 +158,16 @@ mode = smp.losses.MULTILABEL_MODE
 criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
 
 metrics_callback = MetricSMPCallback(
-    metrics={'iou': smp.metrics.iou_score, 'f1_score': smp.metrics.f1_score, },
-    n_img_check_per_epoch_validation=10, n_img_check_per_epoch_train=10,
-    n_img_check_per_epoch_save=True,
+    metrics={
+        'iou': smp.metrics.iou_score,
+        'f1_score': smp.metrics.f1_score,
+    },
+    threshold=0.5,
     activation='sigmoid', mode=mode, colors=colors,
+    n_img_check_per_epoch_validation=10,
+    n_img_check_per_epoch_train=2,
+    n_img_check_per_epoch_save=True,
+    log=True, save_img=True,
 )
 
 start_learning_rate = 1e-3
@@ -185,7 +195,7 @@ best_iou_saver = ModelCheckpoint(
 )
 
 trainer = pl.Trainer(
-    max_epochs=3,
+    max_epochs=10,
     accelerator='cuda', devices=-1, num_sanity_val_steps=0, logger=tb_logger,
     callbacks=[lr_monitor, metrics_callback, best_iou_saver],
 )

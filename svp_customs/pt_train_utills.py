@@ -1,23 +1,18 @@
 import json
+import random
 from pathlib import Path
 
-import cv2
-from typing import Tuple
-import random
 import albumentations as albu
+import cv2
 import numpy as np
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning import Callback
-from pytorch_lightning.loggers import TensorBoardLogger
-
-from torch.utils.data import Dataset
-import segmentation_models_pytorch as smp
 from torch.utils.data import Dataset as BaseDataset
 
+import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.base.modules import Activation
-from svp_customs.utills import glob_search, prepare_img_blob, plt_show_img, get_random_colors
-from albumentations.pytorch import ToTensorV2 as ToTensor
+from svp_customs.utills import glob_search, plt_show_img, get_random_colors, max_show_img_size_reshape
 
 
 class CustomSmokeDataset(BaseDataset):
@@ -223,40 +218,49 @@ class SmokeModel(pl.LightningModule):
 class MetricSMPCallback(Callback):
     def __init__(self,
                  metrics,
+                 classes_separately: bool = True,
                  colors=None,
                  mode='multiclass',
                  reduction='micro-imagewise',
                  ignore_index=None,
                  activation='identity',  # 'identity' just return input
+                 threshold=None,
                  n_img_check_per_epoch_validation: int = 0,
                  n_img_check_per_epoch_train: int = 0,
                  n_img_check_per_epoch_save: bool = False,
+                 save_img: bool = False,
+                 log: bool = False,
                  ) -> None:
-        # maybe binary because each chanel is binary?
-        # from torchmetrics.classification import BinaryJaccardIndex ?
-        # https://torchmetrics.readthedocs.io/en/stable/classification/jaccard_index.html#jaccard-index
         self.metrics = metrics
+        self.classes_separately = classes_separately
         self.colors = get_random_colors(80) if colors is None else colors
 
         self.mode = mode
         self.reduction = reduction
 
+        self.threshold = threshold
         self.ignore_index = ignore_index
         self.activation = Activation(activation)
 
         self.n_img_check_per_epoch_validation = n_img_check_per_epoch_validation
         self.n_img_check_per_epoch_train = n_img_check_per_epoch_train
         self.n_img_check_per_epoch_save = n_img_check_per_epoch_save
+        self.save_img = save_img
+        self.log = log
 
     def _get_metrics(self, preds, gts):
         metric_results = {k: [] for k in self.metrics}
         num_classes = preds.shape[1]
 
+        preds = torch.where(preds >= self.threshold, 1, 0) if self.threshold else preds
+
         tp, fp, fn, tn = smp.metrics.get_stats(
-            preds.long(), gts.long(),
+            output=preds.long(),
+            target=gts.long(),
             mode=self.mode,
+            # threshold=threshold,  # bug with threshold and *.long() format
             num_classes=num_classes,
-            ignore_index=self.ignore_index
+            ignore_index=self.ignore_index,
         )
         # TODO: добавить возможность подсчета метрик по каналам, т.е. по классам (ignore_index?)
         for m_name, metric in self.metrics.items():
@@ -265,7 +269,7 @@ class MetricSMPCallback(Callback):
         return metric_results
 
     @staticmethod
-    def _get_full_color(shape, color, rgb2bgr=True):
+    def _get_full_color(shape, color, rgb2bgr=False):
         channels = []
         for ch in range(len(color)):
             ch_color = torch.full(shape, color[ch])
@@ -274,36 +278,75 @@ class MetricSMPCallback(Callback):
             channels = channels[::-1]
         return torch.stack(channels, dim=0)
 
-    @staticmethod
     @torch.no_grad()
-    def draw_tensor_masks(img_t, gt_mask_t, pred_mask_t, colors, concat_dim=1):  # need for speed
+    def draw_tensor_masks(self, img_t, gt_mask_t, pred_mask_t, to_numpy=False):  # need for speed
         device = img_t.get_device()
+        pred_mask_t_threshold = torch.where(pred_mask_t >= self.threshold, 1, 0) if self.threshold else pred_mask_t
 
         # [-1:1]->[0:255] RGB->BGR
-        img_mask_gt = (img_t[[2, 1, 0], :] * 0.5 + 0.5) * 255  # shape = [3, h, w]
-        img_shape = img_mask_gt.shape[1:]  # [h,w]
-        img_mask_pred = img_mask_gt.clone()
-        for ch_idx, (ch_gt, ch_pred) in enumerate(zip(gt_mask_t, pred_mask_t)):
-            confidences_gt = torch.stack((ch_gt, ch_gt, ch_gt), dim=0)  # shape = [3, h, w]
-            confidences_pred = torch.stack((ch_pred, ch_pred, ch_pred), dim=0)  # shape = [3, h, w]
+        img_t = (img_t * 0.5 + 0.5) * 255  # shape = [3, h, w]
+        img_shape = img_t.shape[1:]  # [h,w]
 
-            full_color = MetricSMPCallback._get_full_color(img_shape, colors[ch_idx]).to(device)
+        img_mask_gt, img_mask_pred, img_mask_pred_thr = img_t.clone(), img_t.clone(), img_t.clone()
+        for ch_idx, (ch_gt, ch_pred, ch_pred_thr) in enumerate(zip(gt_mask_t, pred_mask_t, pred_mask_t_threshold)):
+            # shape = [3, h, w]
+            confidences_gt = torch.stack((ch_gt, ch_gt, ch_gt), dim=0)
+            confidences_pred = torch.stack((ch_pred, ch_pred, ch_pred), dim=0)
+            confidences_pred_thr = torch.stack((ch_pred_thr, ch_pred_thr, ch_pred_thr), dim=0)
+
+            full_color = MetricSMPCallback._get_full_color(img_shape, self.colors[ch_idx]).to(device)
 
             img_mask_gt = img_mask_gt * (1.0 - confidences_gt) + full_color * confidences_gt
             img_mask_pred = img_mask_pred * (1.0 - confidences_pred) + full_color * confidences_pred
+            img_mask_pred_thr = img_mask_pred_thr * (1.0 - confidences_pred_thr) + full_color * confidences_pred_thr
 
-        pred_gt_concat = torch.cat([img_mask_gt, img_mask_pred], dim=concat_dim)  # concat by h or w
-        pred_gt_concat = torch.permute(pred_gt_concat, (1, 2, 0))
-        return pred_gt_concat.cpu().detach().numpy()
+        orig_gt_concat = torch.cat([img_t, img_mask_gt], dim=2)  # concat by w
+        pred_pred_th_concat = torch.cat([img_mask_pred, img_mask_pred_thr], dim=2)  # concat by w
 
+        final_img = torch.cat([orig_gt_concat, pred_pred_th_concat], dim=1)  # concat by h
+        final_img = torch.permute(final_img, (1, 2, 0))
+        if to_numpy:
+            final_img = final_img.cpu().detach().numpy()
+        return final_img
+
+    @staticmethod
+    def _cv2_add_title(img, title,
+                       font=cv2.FONT_HERSHEY_COMPLEX,
+                       font_scale=1, thickness=2,
+                       where='top', color=(0, 0, 0),
+                       ):
+        lines_w = lines_h = 0
+        lines = []
+        for i, line in enumerate(title.split('\n')):
+            lines.append(line)
+            (text_w, text_h), _ = cv2.getTextSize(title, font, font_scale, thickness)
+            lines_w += text_w
+            lines_h += 2 * text_h
+
+        if where == 'top':
+            text_pos_x, text_pos_y = 5, int(lines_h / len(lines))
+            top = lines_h + text_h
+            bottom = left = right = 0
+        if where == 'bottom':
+            pass
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, None, (255, 255, 255))
+
+        for line in lines:
+            cv2.putText(img, line, (text_pos_x, text_pos_y), font, font_scale, color, thickness)
+            if where == 'top':
+                text_pos_y += int(lines_h / len(lines))
+        return img
+
+    @torch.no_grad()
     def _on_shared_batch_end(self, trainer, outputs, batch, batch_idx, stage) -> None:
         imgs, gts = batch
-        loss = round(outputs['loss'], 5)
-
         preds = self.activation(outputs['preds'])
 
+        loss = round(outputs['loss'].item(), 5)
+
         metrics = self._get_metrics(preds=preds, gts=gts)
-        # TODO: проверить подсчет метрик + разделить по каналам
+
+        # TODO: разделить метрики по классам (каналам)
         for m_name, m_val in metrics.items():
             trainer.model.log(f'{m_name}/{stage}', m_val, on_step=False, on_epoch=True)
 
@@ -312,21 +355,36 @@ class MetricSMPCallback(Callback):
 
             save_path = None
             if self.n_img_check_per_epoch_save:
-                logger = trainer._loggers[0].__dict__
-                # TODO: how to prettify it?
-                log_path = Path(logger["_root_dir"], logger["_name"], f'version_{logger["_version"]}')
-                save_path = log_path / 'imgs' / f'{stage}' / f'epoch={trainer.current_epoch}_batch_idx={batch_idx}.jpg'
+                log_path = Path(trainer.model.logger.experiment.get_logdir()) / 'imgs' / stage
+                save_path = log_path / f'epoch={trainer.current_epoch}_batch_idx={batch_idx}.jpg'
                 save_path.parent.mkdir(parents=True, exist_ok=True)
 
-            img_for_show = self.draw_tensor_masks(imgs[0], gts[0], preds[0], colors=self.colors)
-            title = f'{stage}: epoch={trainer.current_epoch} batch_idx={batch_idx} (loss={loss})\n{metrics}'
-            plt_show_img(img_for_show, title=title, mode='plt', save_path=save_path)
+            title = f'{stage}: epoch={trainer.current_epoch} batch_idx={batch_idx} (loss={loss})\n' + \
+                    f'threshold={self.threshold}: {metrics}'
+
+            img_for_show = self.draw_tensor_masks(imgs[0], gts[0], preds[0], to_numpy=True)
+            img_for_show = max_show_img_size_reshape(img_for_show, max_show_img_size=(1400, 1400)).astype(np.uint8)
+            img_for_show = self._cv2_add_title(img_for_show, title)
+
+            if self.log:
+                trainer.model.logger.experiment.add_image(
+                    tag=f'{stage}/{batch_idx}',
+                    img_tensor=img_for_show,
+                    global_step=trainer.current_epoch,
+                    dataformats='HWC'
+                )
+            if save_path is not None:
+                if self.save_img:
+                    cv2.imwrite(str(save_path), cv2.cvtColor(img_for_show, cv2.COLOR_BGR2RGB))
 
     def on_train_epoch_start(self, trainer, pl_module) -> None:
-        self.batches_check_train = random.sample(
-            range(1, trainer.val_check_batch),
-            min(self.n_img_check_per_epoch_train, trainer.val_check_batch)
-        )
+        if trainer.current_epoch == 100:  # if 0 epoch not need to save
+            self.batches_check_train = []
+        else:
+            self.batches_check_train = random.sample(
+                range(0, trainer.val_check_batch),
+                min(self.n_img_check_per_epoch_train, trainer.val_check_batch)
+            )
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
         self._on_shared_batch_end(trainer, outputs, batch, batch_idx, stage='train')
