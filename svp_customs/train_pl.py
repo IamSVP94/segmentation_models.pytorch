@@ -17,21 +17,20 @@ pl.seed_everything(2)
 EXPERIMENT_NAME = 'ClearML testing'
 MODEL_VERSION = 'R10'
 
-# task = Task.init(
-#     project_name='143-NLMK-DCA_Theme4Dim',
-#     task_name=EXPERIMENT_NAME,
-#     tags=['segmentation', 'Smoke_segmentation', 'pl', MODEL_VERSION],
-# )
+task = Task.init(
+    project_name='143-NLMK-DCA_Theme4Dim',
+    task_name=EXPERIMENT_NAME,
+    tags=['segmentation', 'Smoke_segmentation', 'pl', MODEL_VERSION],
+)
 
-# TODO: resize на стадии до разметки или при составлении папки датасета!
+# TODO: resize before train
 train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TRAIN_DATASET/'
 val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST_DATASET/img+jsons/'
-# train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/faketrain/'
-# val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/faketest/'
 
 # TRAIN
+# TODO: add yaml configurator
 arch = 'FPN'
-ENCODER = 'inceptionv4'  # исходный
+ENCODER = 'inceptionv4'
 
 ENCODER_WEIGHTS = 'imagenet'
 CLASSES = ['smoke_cat_1', 'smoke_cat_2']  # 2 classes + 1 background
@@ -78,7 +77,6 @@ train_transform = [
     ),
 ]
 
-train_transform = []
 '''
 train_transform = [
     albu.HorizontalFlip(p=0.5),
@@ -108,7 +106,7 @@ train_transform = [
     ),
     albu.HueSaturationValue(p=0.5, hue_shift_limit=0, sat_shift_limit=30, val_shift_limit=20, ),
 ]
-'''
+# '''
 
 
 def to_tensor(x, **kwargs):
@@ -139,8 +137,10 @@ val_dataset = CustomSmokeDataset(
 )
 
 # window size = 512, 288
+# train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=15)
+# val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=15)
 train_loader = DataLoader(train_dataset, batch_size=20, shuffle=True, num_workers=15)
-val_loader = DataLoader(val_dataset, batch_size=24, shuffle=False, num_workers=15)
+val_loader = DataLoader(val_dataset, batch_size=20, shuffle=False, num_workers=15)
 
 mode = smp.losses.BINARY_MODE
 
@@ -155,21 +155,34 @@ mode = smp.losses.BINARY_MODE
 # ]
 criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
 
+# reduction = none - без агрегации по батчу и каналам size - [B,C]
+# reduction = macro - агрегация (суммирование) по батчу (dim=0) size - [C]
+# reduction = micro - агрегация (суммирование) по батчу и по каналам (dim=[0,1]) size - []
+# reduction = micro-imagewise - агрегация (суммирование) по каналам (dim=1) size - [B]
 metrics_callback = MetricSMPCallback(
     metrics={
         'iou': smp.metrics.iou_score,
         'f1_score': smp.metrics.f1_score,
     },
-    threshold=[0.5, 0.5], classes_separately=True,
+    threshold=[0.5, 0.5], reduction='macro',
+    classes_separately=False,
     activation='sigmoid', mode=mode, colors=colors,
     n_img_check_per_epoch_validation=10,
     n_img_check_per_epoch_train=2,
     n_img_check_per_epoch_save=True,
-    log=True, save_img=True,
+    log_img=False, save_img=True,
 )
 
 start_learning_rate = 1e-3
 
+# n_steps, times = 60, 3  # every "n_steps" steps "times" times
+# scheduler_steps = {n_steps * (i + 1) for i in range(times)}
+# scheduler_steps.add(epochs - 10)
+# print('scheduler_steps:', scheduler_steps)
+# scheduler_steplr = torch.optim.lr_scheduler.MultiStepLR(optimizer, gamma=0.5, milestones=scheduler_steps, verbose=True)
+# scheduler_warmup = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=10, after_scheduler=scheduler_steplr)
+
+# TODO: add scheduler in SmokeModel
 model = SmokeModel(
     arch=arch,
     encoder_name=ENCODER,
@@ -181,15 +194,11 @@ model = SmokeModel(
 )
 
 tb_logger = TensorBoardLogger('lightning_logs', name=f'{arch}_{ENCODER}_{EXPERIMENT_NAME}_model')
-
 lr_monitor = LearningRateMonitor(logging_interval='epoch')
-
 best_iou_saver = ModelCheckpoint(
-    monitor='iou/validation/together',
-    mode='max',
-    save_top_k=1,
-    save_last=True,
-    filename='{epoch:02d}-{step:02d}-{"iou/validation":.4f}',
+    monitor='iou/validation_total',
+    mode='max', save_top_k=1, save_last=True,
+    filename='{epoch:02d}-{step:02d}-{iou/validation_total:.4f}',
 )
 
 trainer = pl.Trainer(
@@ -198,11 +207,7 @@ trainer = pl.Trainer(
     callbacks=[lr_monitor, metrics_callback, best_iou_saver],
 )
 
-trainer.fit(
-    model=model,
-    train_dataloaders=train_loader,
-    val_dataloaders=val_loader,
-)
+trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader, )
 
 # valid_metrics = trainer.validate(model, dataloaders=val_loader, verbose=False)
 # print(113, valid_metrics)

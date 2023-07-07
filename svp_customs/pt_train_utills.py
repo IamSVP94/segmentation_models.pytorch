@@ -215,7 +215,7 @@ class MetricSMPCallback(Callback):
                  metrics,
                  classes_separately: bool = False,
                  colors=None,
-                 mode='multiclass',
+                 mode='binary',
                  reduction='micro-imagewise',
                  activation='identity',  # 'identity' just return input
                  threshold=None,
@@ -223,7 +223,7 @@ class MetricSMPCallback(Callback):
                  n_img_check_per_epoch_train: int = 0,
                  n_img_check_per_epoch_save: bool = False,
                  save_img: bool = False,
-                 log: bool = False,
+                 log_img: bool = False,
                  ) -> None:
         self.metrics = metrics
         self.classes_separately = classes_separately
@@ -239,7 +239,7 @@ class MetricSMPCallback(Callback):
         self.n_img_check_per_epoch_train = n_img_check_per_epoch_train
         self.n_img_check_per_epoch_save = n_img_check_per_epoch_save
         self.save_img = save_img
-        self.log = log
+        self.log_img = log_img
 
     def _get_metrics(self, preds, gts, trainer):
         metric_results = {k: dict() for k in self.metrics}
@@ -250,22 +250,22 @@ class MetricSMPCallback(Callback):
             output=preds.long(),
             target=gts.long(),
             mode=self.mode,
-        )
+        )  # [B,C]
 
-        if self.classes_separately:
-            for m_name, metric in self.metrics.items():
-                metric_results[m_name] = {}
-                for cl_idx, cl_name in enumerate(trainer.model.classes):
-                    cl_tp = tp[:, cl_idx].unsqueeze(-1)
-                    cl_fp = fp[:, cl_idx].unsqueeze(-1)
-                    cl_fn = fn[:, cl_idx].unsqueeze(-1)
-                    cl_tn = tn[:, cl_idx].unsqueeze(-1)
+        for m_name, metric in self.metrics.items():
+            metric_results[m_name] = {}
+            classes = trainer.model.classes if self.classes_separately else []
+            for cl_idx, cl_name in enumerate(classes):
+                cl_tp = tp[:, cl_idx].unsqueeze(-1)
+                cl_fp = fp[:, cl_idx].unsqueeze(-1)
+                cl_fn = fn[:, cl_idx].unsqueeze(-1)
+                cl_tn = tn[:, cl_idx].unsqueeze(-1)
 
-                    per_image_metric = metric(cl_tp, cl_fp, cl_fn, cl_tn, reduction=self.reduction)
-                    metric_results[m_name][cl_name] = round(per_image_metric.item(), 4)
-                else:
-                    per_image_metric = metric(tp, fp, fn, tn, reduction=self.reduction)
-                    metric_results[m_name]['together'] = round(per_image_metric.item(), 4)
+                per_image_metric = metric(cl_tp, cl_fp, cl_fn, cl_tn, reduction=self.reduction)
+                metric_results[m_name][cl_name] = round(per_image_metric.item(), 4)
+            else:
+                per_image_metric = metric(tp, fp, fn, tn, reduction=self.reduction)
+                metric_results[m_name]['total'] = round(per_image_metric.item(), 4)
         return metric_results
 
     def _get_metrics_old(self, preds, gts):
@@ -278,9 +278,7 @@ class MetricSMPCallback(Callback):
             output=preds.long(),
             target=gts.long(),
             mode=self.mode,
-            # threshold=threshold,  # bug with threshold and *.long() format
             num_classes=num_classes,
-            # ignore_index=self.ignore_index,
         )
         for m_name, metric in self.metrics.items():
             per_image_metric = metric(tp, fp, fn, tn, reduction=self.reduction)
@@ -373,17 +371,16 @@ class MetricSMPCallback(Callback):
     def _on_shared_batch_end(self, trainer, outputs, batch, batch_idx, stage) -> None:
         imgs, gts = batch
         preds = self.activation(outputs['preds'])
-
         loss = round(outputs['loss'].item(), 5)
 
         metrics = self._get_metrics(preds=preds, gts=gts, trainer=trainer)
-
         for m_name, m_vals in metrics.items():
             for cl_name, m_val in m_vals.items():
-                trainer.model.log(f'{m_name}/{stage}/{cl_name}', m_val, on_step=False, on_epoch=True)
+                trainer.model.log(f'{m_name}/{stage}_{cl_name}', m_val, on_step=False, on_epoch=True)
 
         if stage in ['validation'] and batch_idx in self.batches_check_validation or \
                 stage in ['train'] and batch_idx in self.batches_check_train:
+
             save_path = None
             if self.n_img_check_per_epoch_save:
                 log_path = Path(trainer.model.logger.experiment.get_logdir()) / 'imgs' / stage
@@ -400,19 +397,18 @@ class MetricSMPCallback(Callback):
             img_for_show = max_show_img_size_reshape(img_for_show, max_show_img_size=(1400, 1400)).astype(np.uint8)
             img_for_show = self._cv2_add_title(img_for_show, title)
 
-            if self.log:
+            if self.save_img and save_path:
+                cv2.imwrite(str(save_path), cv2.cvtColor(img_for_show, cv2.COLOR_BGR2RGB))
+            if self.log_img:
                 trainer.model.logger.experiment.add_image(
                     tag=f'{stage}/{batch_idx}',
                     img_tensor=img_for_show,
                     global_step=trainer.current_epoch,
                     dataformats='HWC'
                 )
-            if save_path is not None:
-                if self.save_img:
-                    cv2.imwrite(str(save_path), cv2.cvtColor(img_for_show, cv2.COLOR_BGR2RGB))
 
     def on_train_epoch_start(self, trainer, pl_module) -> None:
-        if trainer.current_epoch == 100:  # if 0 epoch not need to save
+        if trainer.current_epoch == 0:  # if 0 epoch not need to save
             self.batches_check_train = []
         else:
             self.batches_check_train = random.sample(
