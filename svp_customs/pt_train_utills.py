@@ -141,12 +141,13 @@ class CustomSmokeDataset(BaseDataset):
 
 class SmokeModel(pl.LightningModule):
     def __init__(self, arch, encoder_name, activation,
-                 loss_fn, out_classes,
+                 loss_fn, classes,
                  in_channels=3, start_learning_rate=1e-3,
                  **kwargs):
         super().__init__()
+        self.classes = classes
         self.model = smp.create_model(
-            arch, encoder_name=encoder_name, activation=activation, in_channels=in_channels, classes=out_classes,
+            arch, encoder_name=encoder_name, activation=activation, in_channels=in_channels, classes=len(self.classes),
             **kwargs
         )
 
@@ -164,16 +165,13 @@ class SmokeModel(pl.LightningModule):
         image = (image - self.mean) / self.std  # need this?
         # TODO: compare blob with opencv blob
         pred = self.model(image)
-        # print(168, pred.shape)
-        # print(169, pred)
-        # exit()
         return pred
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.start_learning_rate,
-            weight_decay=1e-3,
+            # weight_decay=1e-3,
         )
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         #     optimizer, mode='min', factor=0.5,
@@ -190,9 +188,6 @@ class SmokeModel(pl.LightningModule):
     def _shared_step(self, batch, stage):
         imgs, gts = batch
         preds = self.forward(imgs)
-
-        # - **y_pred** - torch.Tensor of shape NxCxHxW
-        # - **y_true** - torch.Tensor of shape NxHxW or Nx1xHxW
 
         ''' list of losses
         total_loss = 0
@@ -218,11 +213,10 @@ class SmokeModel(pl.LightningModule):
 class MetricSMPCallback(Callback):
     def __init__(self,
                  metrics,
-                 classes_separately: bool = True,
+                 classes_separately: bool = False,
                  colors=None,
                  mode='multiclass',
                  reduction='micro-imagewise',
-                 ignore_index=None,
                  activation='identity',  # 'identity' just return input
                  threshold=None,
                  n_img_check_per_epoch_validation: int = 0,
@@ -239,7 +233,6 @@ class MetricSMPCallback(Callback):
         self.reduction = reduction
 
         self.threshold = threshold
-        self.ignore_index = ignore_index
         self.activation = Activation(activation)
 
         self.n_img_check_per_epoch_validation = n_img_check_per_epoch_validation
@@ -248,7 +241,34 @@ class MetricSMPCallback(Callback):
         self.save_img = save_img
         self.log = log
 
-    def _get_metrics(self, preds, gts):
+    def _get_metrics(self, preds, gts, trainer):
+        metric_results = {k: dict() for k in self.metrics}
+
+        preds = self._get_preds_after_threshold(preds, self.threshold) if self.threshold else preds
+
+        tp, fp, fn, tn = smp.metrics.get_stats(
+            output=preds.long(),
+            target=gts.long(),
+            mode=self.mode,
+        )
+
+        if self.classes_separately:
+            for m_name, metric in self.metrics.items():
+                metric_results[m_name] = {}
+                for cl_idx, cl_name in enumerate(trainer.model.classes):
+                    cl_tp = tp[:, cl_idx].unsqueeze(-1)
+                    cl_fp = fp[:, cl_idx].unsqueeze(-1)
+                    cl_fn = fn[:, cl_idx].unsqueeze(-1)
+                    cl_tn = tn[:, cl_idx].unsqueeze(-1)
+
+                    per_image_metric = metric(cl_tp, cl_fp, cl_fn, cl_tn, reduction=self.reduction)
+                    metric_results[m_name][cl_name] = round(per_image_metric.item(), 4)
+                else:
+                    per_image_metric = metric(tp, fp, fn, tn, reduction=self.reduction)
+                    metric_results[m_name]['together'] = round(per_image_metric.item(), 4)
+        return metric_results
+
+    def _get_metrics_old(self, preds, gts):
         metric_results = {k: [] for k in self.metrics}
         num_classes = preds.shape[1]
 
@@ -260,9 +280,8 @@ class MetricSMPCallback(Callback):
             mode=self.mode,
             # threshold=threshold,  # bug with threshold and *.long() format
             num_classes=num_classes,
-            ignore_index=self.ignore_index,
+            # ignore_index=self.ignore_index,
         )
-        # TODO: добавить возможность подсчета метрик по каналам, т.е. по классам (ignore_index?)
         for m_name, metric in self.metrics.items():
             per_image_metric = metric(tp, fp, fn, tn, reduction=self.reduction)
             metric_results[m_name] = round(per_image_metric.item(), 4)
@@ -278,10 +297,23 @@ class MetricSMPCallback(Callback):
             channels = channels[::-1]
         return torch.stack(channels, dim=0)
 
+    @staticmethod
+    def _get_preds_after_threshold(preds, threshold):
+        preds_thr = []
+        for cl in range(preds.shape[-3]):  # skip h,w from tail
+            if len(preds.shape) == 3:
+                ch_preds = torch.where(preds[cl, :, :] >= threshold[cl], 1, 0)
+            elif len(preds.shape) == 4:
+                ch_preds = torch.where(preds[:, cl, :, :] >= threshold[cl], 1, 0)
+            preds_thr.append(ch_preds)
+        return torch.stack(preds_thr, dim=-3)
+
     @torch.no_grad()
     def draw_tensor_masks(self, img_t, gt_mask_t, pred_mask_t, to_numpy=False):  # need for speed
         device = img_t.get_device()
-        pred_mask_t_threshold = torch.where(pred_mask_t >= self.threshold, 1, 0) if self.threshold else pred_mask_t
+
+        pred_mask_t_threshold = self._get_preds_after_threshold(
+            pred_mask_t, self.threshold) if self.threshold else pred_mask_t
 
         # [-1:1]->[0:255] RGB->BGR
         img_t = (img_t * 0.5 + 0.5) * 255  # shape = [3, h, w]
@@ -344,23 +376,25 @@ class MetricSMPCallback(Callback):
 
         loss = round(outputs['loss'].item(), 5)
 
-        metrics = self._get_metrics(preds=preds, gts=gts)
+        metrics = self._get_metrics(preds=preds, gts=gts, trainer=trainer)
 
-        # TODO: разделить метрики по классам (каналам)
-        for m_name, m_val in metrics.items():
-            trainer.model.log(f'{m_name}/{stage}', m_val, on_step=False, on_epoch=True)
+        for m_name, m_vals in metrics.items():
+            for cl_name, m_val in m_vals.items():
+                trainer.model.log(f'{m_name}/{stage}/{cl_name}', m_val, on_step=False, on_epoch=True)
 
         if stage in ['validation'] and batch_idx in self.batches_check_validation or \
                 stage in ['train'] and batch_idx in self.batches_check_train:
-
             save_path = None
             if self.n_img_check_per_epoch_save:
                 log_path = Path(trainer.model.logger.experiment.get_logdir()) / 'imgs' / stage
                 save_path = log_path / f'epoch={trainer.current_epoch}_batch_idx={batch_idx}.jpg'
                 save_path.parent.mkdir(parents=True, exist_ok=True)
 
-            title = f'{stage}: epoch={trainer.current_epoch} batch_idx={batch_idx} (loss={loss})\n' + \
-                    f'threshold={self.threshold}: {metrics}'
+            title = f'{stage}: epoch={trainer.current_epoch} batch_idx={batch_idx} (loss={loss})\n'
+            title += f'threshold={self.threshold}\n'
+            for m_name, cl_vals in metrics.items():
+                for cl_name, m_cl_val in cl_vals.items():
+                    title += f'{m_name}: {cl_name} - {m_cl_val}\n'
 
             img_for_show = self.draw_tensor_masks(imgs[0], gts[0], preds[0], to_numpy=True)
             img_for_show = max_show_img_size_reshape(img_for_show, max_show_img_size=(1400, 1400)).astype(np.uint8)

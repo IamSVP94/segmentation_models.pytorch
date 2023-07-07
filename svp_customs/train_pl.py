@@ -142,8 +142,6 @@ val_dataset = CustomSmokeDataset(
 train_loader = DataLoader(train_dataset, batch_size=20, shuffle=True, num_workers=15)
 val_loader = DataLoader(val_dataset, batch_size=24, shuffle=False, num_workers=15)
 
-# mode = smp.losses.MULTILABEL_MODE
-# mode = smp.losses.MULTICLASS_MODE
 mode = smp.losses.BINARY_MODE
 
 # from old version
@@ -162,7 +160,7 @@ metrics_callback = MetricSMPCallback(
         'iou': smp.metrics.iou_score,
         'f1_score': smp.metrics.f1_score,
     },
-    threshold=0.5,
+    threshold=[0.5, 0.5], classes_separately=True,
     activation='sigmoid', mode=mode, colors=colors,
     n_img_check_per_epoch_validation=10,
     n_img_check_per_epoch_train=2,
@@ -178,7 +176,7 @@ model = SmokeModel(
     activation=ACTIVATION,
     loss_fn=criterion,
     in_channels=3,  # RGB
-    out_classes=len(CLASSES),
+    classes=CLASSES,
     start_learning_rate=start_learning_rate,
 )
 
@@ -187,7 +185,7 @@ tb_logger = TensorBoardLogger('lightning_logs', name=f'{arch}_{ENCODER}_{EXPERIM
 lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
 best_iou_saver = ModelCheckpoint(
-    monitor='iou/validation',
+    monitor='iou/validation/together',
     mode='max',
     save_top_k=1,
     save_last=True,
