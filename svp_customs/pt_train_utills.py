@@ -145,6 +145,7 @@ class SmokeModel(pl.LightningModule):
                  in_channels=3, start_learning_rate=1e-3,
                  **kwargs):
         super().__init__()
+        self.save_hyperparameters()  # for logging
         self.classes = classes
         self.model = smp.create_model(
             arch, encoder_name=encoder_name, activation=activation, in_channels=in_channels, classes=len(self.classes),
@@ -174,16 +175,13 @@ class SmokeModel(pl.LightningModule):
             # weight_decay=1e-3,
         )
         # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        #     optimizer, mode='min', factor=0.5,
-        #     patience=10, cooldown=5,
-        #     min_lr=1e-7, eps=1e-7,
-        #     verbose=True,
+        #     optimizer, mode='min', verbose=True,
+        #     factor=0.5, patience=15, cooldown=5, min_lr=1e-5, eps=1e-7,
         # )
-
         major_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
-        # scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=10, after_scheduler=major_scheduler)
-        # return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": 'loss/validation'}
+
         return {"optimizer": optimizer, "lr_scheduler": major_scheduler, "monitor": 'loss/validation'}
+        # return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": 'loss/validation'}
 
     def _shared_step(self, batch, stage):
         imgs, gts = batch
@@ -196,6 +194,7 @@ class SmokeModel(pl.LightningModule):
         # '''
 
         total_loss = self.loss_fn(preds, gts)
+        # print(201, stage, self.training, total_loss)  # check the current stage is training (stage & grad param)?
 
         self.log(f'loss/{stage}', total_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         return {'loss': total_loss, 'preds': preds}
@@ -208,6 +207,28 @@ class SmokeModel(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         return self._shared_step(batch, stage='test')
+
+    def save_onnx_best(self, weights, window_size, onnx_path, need_sigmoid_activation=True, dynamic_batch=True):
+        weights = torch.load(weights, map_location="cpu")
+        self.load_state_dict(weights['state_dict'])
+        if need_sigmoid_activation:  # logits to probs
+            self.model.segmentation_head[-1].activation = torch.nn.Sigmoid()
+
+        input_width, input_height = window_size  # w,h format
+        x = torch.randn(1, 3, input_height, input_width, requires_grad=True)
+        params = {
+            'export_params': True,
+            'opset_version': 11,
+            'do_constant_folding': True,
+            'input_names': ["input"],
+            'output_names': ["output"],
+        }
+        if dynamic_batch:
+            params['dynamic_axes'] = {
+                "input": {0: "batch"},
+                "output": {0: "batch"}
+            }
+        torch.onnx.export(model=self.model, args=x, f=str(onnx_path), **params)
 
 
 class MetricSMPCallback(Callback):
@@ -240,7 +261,14 @@ class MetricSMPCallback(Callback):
         self.n_img_check_per_epoch_save = n_img_check_per_epoch_save
         self.save_img = save_img
         self.log_img = log_img
+        '''
+        # reduction = none - без агрегации по батчу и каналам size - [B,C]
+        # reduction = macro - агрегация (суммирование) по батчу (dim=0) size - [C]
+        # reduction = micro - агрегация (суммирование) по батчу и по каналам (dim=[0,1]) size - []
+        # reduction = micro-imagewise - агрегация (суммирование) по каналам (dim=1) size - [B]
+        '''
 
+    @torch.no_grad()
     def _get_metrics(self, preds, gts, trainer):
         metric_results = {k: dict() for k in self.metrics}
 
@@ -266,23 +294,6 @@ class MetricSMPCallback(Callback):
             else:
                 per_image_metric = metric(tp, fp, fn, tn, reduction=self.reduction)
                 metric_results[m_name]['total'] = round(per_image_metric.item(), 4)
-        return metric_results
-
-    def _get_metrics_old(self, preds, gts):
-        metric_results = {k: [] for k in self.metrics}
-        num_classes = preds.shape[1]
-
-        preds = torch.where(preds >= self.threshold, 1, 0) if self.threshold else preds
-
-        tp, fp, fn, tn = smp.metrics.get_stats(
-            output=preds.long(),
-            target=gts.long(),
-            mode=self.mode,
-            num_classes=num_classes,
-        )
-        for m_name, metric in self.metrics.items():
-            per_image_metric = metric(tp, fp, fn, tn, reduction=self.reduction)
-            metric_results[m_name] = round(per_image_metric.item(), 4)
         return metric_results
 
     @staticmethod
@@ -395,6 +406,7 @@ class MetricSMPCallback(Callback):
 
             img_for_show = self.draw_tensor_masks(imgs[0], gts[0], preds[0], to_numpy=True)
             img_for_show = max_show_img_size_reshape(img_for_show, max_show_img_size=(1400, 1400)).astype(np.uint8)
+            # TODO: metrics for batch, not for current img!!!
             img_for_show = self._cv2_add_title(img_for_show, title)
 
             if self.save_img and save_path:
@@ -416,14 +428,14 @@ class MetricSMPCallback(Callback):
                 min(self.n_img_check_per_epoch_train, trainer.val_check_batch)
             )
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
-        self._on_shared_batch_end(trainer, outputs, batch, batch_idx, stage='train')
-
     def on_validation_epoch_start(self, trainer, pl_module) -> None:
         self.batches_check_validation = random.sample(
             range(0, trainer.val_check_batch),
             min(self.n_img_check_per_epoch_validation, trainer.val_check_batch)
         )
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        self._on_shared_batch_end(trainer, outputs, batch, batch_idx, stage='train')
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
         self._on_shared_batch_end(trainer, outputs, batch, batch_idx, stage='validation')

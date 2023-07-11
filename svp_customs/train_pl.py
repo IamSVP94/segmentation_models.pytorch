@@ -1,16 +1,14 @@
-import cv2
-import albumentations as albu
 import torch
-from pytorch_lightning.loggers import TensorBoardLogger
+from clearml import Task
+from pathlib import Path
+import albumentations as albu
+import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
-from svp_customs.constants import PROJECT_DIR
-from svp_customs.pt_train_utills import CustomSmokeDataset, SmokeModel, MetricSMPCallback
 from svp_customs.utills import plt_show_img
-import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-
-from clearml import Task
+from svp_customs.pt_train_utills import CustomSmokeDataset, SmokeModel, MetricSMPCallback
 
 pl.seed_everything(2)
 
@@ -39,8 +37,8 @@ colors = [(0, 0, 255), (0, 255, 0)]
 ACTIVATION = None  # could be None for logits or 'softmax2d' for multicalss segmentation
 
 # input_width, input_height = 1920, 1088
-# input_width, input_height = 1280, 736
-input_width, input_height = 512, 288
+input_width, input_height = 1280, 736
+# input_width, input_height = 512, 288
 
 train_transform = [
     albu.HorizontalFlip(p=0.5),
@@ -136,36 +134,25 @@ val_dataset = CustomSmokeDataset(
     classes=CLASSES, preprocessing=get_preprocessing(preprocessing_fn),
 )
 
-# window size = 512, 288
-# train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=15)
-# val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=15)
-train_loader = DataLoader(train_dataset, batch_size=20, shuffle=True, num_workers=15)
-val_loader = DataLoader(val_dataset, batch_size=20, shuffle=False, num_workers=15)
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=15)
+val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=15)
 
 mode = smp.losses.BINARY_MODE
-
-# from old version
-# weighted = torch.tensor([1, 10])
-# loss = smp.utils.losses.BCEWithLogitsLoss(weight=torch.reshape(weighted, (1, len(CLASSES), 1, 1)))
 
 # criterion = [
 #     smp.losses.DiceLoss(from_logits=True, log_loss=True, mode=mode, ),
 #     smp.losses.SoftBCEWithLogitsLoss(reduction='mean'),
 #     torch.nn.BCEWithLogitsLoss(reduction='mean'),
 # ]
+# TODO: составной лосс
 criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
 
-# reduction = none - без агрегации по батчу и каналам size - [B,C]
-# reduction = macro - агрегация (суммирование) по батчу (dim=0) size - [C]
-# reduction = micro - агрегация (суммирование) по батчу и по каналам (dim=[0,1]) size - []
-# reduction = micro-imagewise - агрегация (суммирование) по каналам (dim=1) size - [B]
 metrics_callback = MetricSMPCallback(
     metrics={
         'iou': smp.metrics.iou_score,
         'f1_score': smp.metrics.f1_score,
     },
-    threshold=[0.5, 0.5], reduction='macro',
-    classes_separately=False,
+    threshold=[0.5, 0.5], reduction='macro', classes_separately=True,
     activation='sigmoid', mode=mode, colors=colors,
     n_img_check_per_epoch_validation=10,
     n_img_check_per_epoch_train=2,
@@ -173,7 +160,7 @@ metrics_callback = MetricSMPCallback(
     log_img=False, save_img=True,
 )
 
-start_learning_rate = 1e-3
+start_learning_rate = 1e-4
 
 # n_steps, times = 60, 3  # every "n_steps" steps "times" times
 # scheduler_steps = {n_steps * (i + 1) for i in range(times)}
@@ -202,26 +189,27 @@ best_iou_saver = ModelCheckpoint(
 )
 
 trainer = pl.Trainer(
-    max_epochs=10,
+    max_epochs=283,
     accelerator='cuda', devices=-1, num_sanity_val_steps=0, logger=tb_logger,
     callbacks=[lr_monitor, metrics_callback, best_iou_saver],
 )
 
-trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader, )
+# if from ckpt
+weights = None
 
-# valid_metrics = trainer.validate(model, dataloaders=val_loader, verbose=False)
-# print(113, valid_metrics)
+trainer.fit(
+    model=model,
+    train_dataloaders=train_loader,
+    val_dataloaders=val_loader,
+    ckpt_path=weights,
+)
+# valid_metrics = trainer.validate(model, dataloaders=val_loader, verbose=True)
 
-# save bst model like ONNX
-# model_path_pth = f'/home/vid/hdd/projects/PycharmProjects/open-metric-learning/temp/cashbox/oml7_{model.arch}_{epochs}_CustomLoss_{input_size[0]}x{input_size[1]}_{model.feat_dim}_distrib.pth'
-# trainer.save_checkpoint(filepath=model_path_pth, weights_only=True)  # we don't pass loaders to .fit() in DDP
-#
-# model_path_onnx = Path(model_path_pth).with_suffix(f'.onnx')
-# x = torch.randn(1, 3, input_size[1], input_size[0], requires_grad=True)
-# torch.onnx.export(pl_model, x, str(model_path_onnx),
-#                   export_params=True, verbose=True,
-#                   opset_version=11,
-#                   do_constant_folding=True,
-#                   input_names=['input'],  # the model's input names
-#                   output_names=['output'],
-#                   )
+logger_weights_dir = Path(best_iou_saver.best_model_path).parent.parent
+ONNX_PATH = logger_weights_dir / f'{arch}_{ENCODER}_{MODEL_VERSION}_{input_width}x{input_height}.onnx'
+
+model.save_onnx_best(
+    weights=best_iou_saver.best_model_path,
+    window_size=(input_width, input_height),
+    onnx_path=ONNX_PATH,
+)
