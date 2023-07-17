@@ -1,3 +1,4 @@
+import cv2
 import torch
 from clearml import Task
 from pathlib import Path
@@ -5,41 +6,43 @@ import albumentations as albu
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
-from svp_customs.utills import plt_show_img
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from svp_customs.pt_train_utills import CustomSmokeDataset, SmokeModel, MetricSMPCallback
 
 pl.seed_everything(2)
 
-EXPERIMENT_NAME = 'ClearML testing'
+EXPERIMENT_NAME = 'FPN_inceptionv4'
 MODEL_VERSION = 'R10'
 
 task = Task.init(
     project_name='143-NLMK-DCA_Theme4Dim',
     task_name=EXPERIMENT_NAME,
-    tags=['segmentation', 'Smoke_segmentation', 'pl', MODEL_VERSION],
+    tags=['segmentation', 'Smoke_segmentation', 'pl', MODEL_VERSION, 'self_augmentation_v2'],
 )
 
 # TODO: resize before train
 train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TRAIN_DATASET/'
-val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST_DATASET/img+jsons/'
+val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/VAL_DATASET/'
+test_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST_DATASET/'
 
-# TRAIN
 # TODO: add yaml configurator
 arch = 'FPN'
 ENCODER = 'inceptionv4'
+# arch = 'UnetPlusPlus'
+# ENCODER = 'resnet34'
 
 ENCODER_WEIGHTS = 'imagenet'
 CLASSES = ['smoke_cat_1', 'smoke_cat_2']  # 2 classes + 1 background
 colors = [(0, 0, 255), (0, 255, 0)]
 
-ACTIVATION = None  # could be None for logits or 'softmax2d' for multicalss segmentation
+ACTIVATION = None
 
 # input_width, input_height = 1920, 1088
 input_width, input_height = 1280, 736
 # input_width, input_height = 512, 288
 
+'''
 train_transform = [
     albu.HorizontalFlip(p=0.5),
     albu.ShiftScaleRotate(scale_limit=0.5, rotate_limit=0, shift_limit=0.1, p=1, border_mode=0),
@@ -74,8 +77,9 @@ train_transform = [
         p=0.9,
     ),
 ]
-
 '''
+
+# '''
 train_transform = [
     albu.HorizontalFlip(p=0.5),
     albu.ShiftScaleRotate(scale_limit=0.5, rotate_limit=0, shift_limit=0.1, p=1, border_mode=cv2.BORDER_REFLECT_101),
@@ -104,6 +108,8 @@ train_transform = [
     ),
     albu.HueSaturationValue(p=0.5, hue_shift_limit=0, sat_shift_limit=30, val_shift_limit=20, ),
 ]
+
+
 # '''
 
 
@@ -119,18 +125,18 @@ def get_preprocessing(preprocessing_fn):
     return albu.Compose(_transform)
 
 
-preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
+# TODO: write fix preprocessing for easy subsequent using with ONNX
+preprocessing_fn = smp.encoders.get_preprocessing_fn('inceptionv4', 'imagenet')  # fix std, mean = [0.5,0.5,0.5]
+# preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
 
 train_dataset = CustomSmokeDataset(
-    dataset_dir=train_dir,
-    input_width=input_width, input_height=input_height,
+    dataset_dir=train_dir, input_width=input_width, input_height=input_height,
     classes=CLASSES, preprocessing=get_preprocessing(preprocessing_fn),
     augmentation=train_transform,
 )
 
 val_dataset = CustomSmokeDataset(
-    dataset_dir=train_dir,
-    input_width=input_width, input_height=input_height,
+    dataset_dir=val_dir, input_width=input_width, input_height=input_height,
     classes=CLASSES, preprocessing=get_preprocessing(preprocessing_fn),
 )
 
@@ -160,7 +166,7 @@ metrics_callback = MetricSMPCallback(
     log_img=False, save_img=True,
 )
 
-start_learning_rate = 1e-4
+start_learning_rate = 1e-3
 
 # n_steps, times = 60, 3  # every "n_steps" steps "times" times
 # scheduler_steps = {n_steps * (i + 1) for i in range(times)}
@@ -185,17 +191,20 @@ lr_monitor = LearningRateMonitor(logging_interval='epoch')
 best_iou_saver = ModelCheckpoint(
     monitor='iou/validation_total',
     mode='max', save_top_k=1, save_last=True,
-    filename='{epoch:02d}-{step:02d}-{iou/validation_total:.4f}',
+    filename='epoch={epoch:02d}-iou_validation_total={iou/validation_total:.4f}',
+    auto_insert_metric_name=False,
 )
 
 trainer = pl.Trainer(
-    max_epochs=283,
-    accelerator='cuda', devices=-1, num_sanity_val_steps=0, logger=tb_logger,
+    max_epochs=300,
+    accelerator='cuda',
+    devices=-1,
+    num_sanity_val_steps=0,
+    logger=tb_logger,
     callbacks=[lr_monitor, metrics_callback, best_iou_saver],
 )
 
-# if from ckpt
-weights = None
+weights = '/home/vid/hdd/projects/PycharmProjects/segmentation_models.pytorch_iamsvp94/svp_customs/lightning_logs/FPN_inceptionv4_FPN_inceptionv4_model/version_3/checkpoints/epoch=epoch=61-iou_validation=iou/validation_total=0.6657.ckpt'
 
 trainer.fit(
     model=model,
@@ -203,7 +212,13 @@ trainer.fit(
     val_dataloaders=val_loader,
     ckpt_path=weights,
 )
-# valid_metrics = trainer.validate(model, dataloaders=val_loader, verbose=True)
+
+test_dataset = CustomSmokeDataset(
+    dataset_dir=test_dir, input_width=input_width, input_height=input_height,
+    classes=CLASSES, preprocessing=get_preprocessing(preprocessing_fn),
+)
+test_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=15)
+test_metrics = trainer.test(model, dataloaders=test_loader, ckpt_path=best_iou_saver.best_model_path, verbose=True)
 
 logger_weights_dir = Path(best_iou_saver.best_model_path).parent.parent
 ONNX_PATH = logger_weights_dir / f'{arch}_{ENCODER}_{MODEL_VERSION}_{input_width}x{input_height}.onnx'

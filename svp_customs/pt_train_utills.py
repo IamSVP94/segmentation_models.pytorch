@@ -32,7 +32,7 @@ class CustomSmokeDataset(BaseDataset):
             if json_path.exists():
                 self.masks.append(json_path)
             else:
-                self.imgs.remove(img_path)  # del img if have not maskfile
+                self.imgs.remove(img_path)  # del img from list if maskfile.json does'n exist
                 print(f'{str(json_path)} does not exist!')
 
         self.input_size = (input_width, input_height)
@@ -66,7 +66,7 @@ class CustomSmokeDataset(BaseDataset):
                 img_mask[bool_class_mask] = colors[ch]
         img_mask = cv2.cvtColor(img_mask.astype(np.uint8), cv2.COLOR_BGR2RGB)
         # empty_image = cv2.cvtColor(empty_image.astype(np.uint8), cv2.COLOR_BGR2RGB)
-        plt_show_img(img_mask, title=f'detected classes: {chs}', mode=mode)
+        # plt_show_img(img_mask, title=f'detected classes: {chs}', mode=mode)
         # plt_show_img(empty_image)
 
     def __getitem__(self, item):
@@ -90,7 +90,7 @@ class CustomSmokeDataset(BaseDataset):
         # /img mask '''
 
         # json mask
-        mask = self.make_mask_from_json(mask_path)
+        mask = self._make_mask_from_json(mask_path)
         # /json mask
 
         # apply augmentations
@@ -107,7 +107,7 @@ class CustomSmokeDataset(BaseDataset):
             image, mask = sample['image'], sample['mask']
         return image, mask
 
-    def make_mask_from_json(self, json_path):
+    def _make_mask_from_json(self, json_path):
         with open(json_path, 'r') as label_json:
             json_txt = json.load(label_json)
         orig_h, orig_w = json_txt["imageHeight"], json_txt["imageWidth"]
@@ -139,10 +139,73 @@ class CustomSmokeDataset(BaseDataset):
         return mask
 
 
+class InferenceSmokeDataset(BaseDataset):
+    def __init__(
+            self,
+            dataset_dir,
+            input_width=1920,
+            input_height=1088,
+            classes=None,
+            preprocessing=None,
+    ):
+        self.imgs = glob_search(dataset_dir, sort=True, exception_if_empty=True)
+        self.input_size = (input_width, input_height)
+
+        # convert str names to class values on masks
+        self.classes = classes
+        self.class_values = [idx + 1 for idx, c in enumerate(self.classes)]
+
+        self.preprocessing = preprocessing
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def __getitem__(self, item):
+        img_path = self.imgs[item]
+        image = cv2.imread(str(img_path))
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        if image.shape[:2] != self.input_size[::-1]:
+            image = cv2.resize(image, self.input_size, interpolation=cv2.INTER_NEAREST)
+
+        # apply preprocessing
+        if self.preprocessing:
+            sample = self.preprocessing(image=image)
+            image = sample['image']
+        # return {'image': image, 'path': img_path}
+        return image
+
+    # @staticmethod
+    #     def _get_preds_after_threshold(preds, threshold):
+    #         preds_thr = []
+    #         for cl in range(preds.shape[-3]):  # skip h,w from tail
+    #             if len(preds.shape) == 3:
+    #                 ch_preds = torch.where(preds[cl, :, :] >= threshold[cl], 1, 0)
+    #             elif len(preds.shape) == 4:
+    #                 ch_preds = torch.where(preds[:, cl, :, :] >= threshold[cl], 1, 0)
+    #             preds_thr.append(ch_preds)
+    #         return torch.stack(preds_thr, dim=-3)
+    @staticmethod
+    def draw_mask(img, mask, colors=get_random_colors(3), thresholds=None):
+        if thresholds:
+            preds_thr = []
+            for cl in range(mask.shape[-1]):
+                bool_class_mask = np.where(mask[:, :, cl] > thresholds[cl], 1, 0)
+                preds_thr.append(bool_class_mask)
+            mask = np.stack(preds_thr).transpose(1, 2, 0)
+
+        img_mask_pred = img.copy()
+        for ch_idx in range(mask.shape[-1]):
+            ch_pred = mask[:, :, ch_idx]
+            confidences_pred = np.stack((ch_pred, ch_pred, ch_pred)).transpose(1, 2, 0)
+            full_color = np.full(shape=confidences_pred.shape, fill_value=colors[ch_idx][::-1])
+            img_mask_pred = img_mask_pred * (1.0 - confidences_pred) + full_color * confidences_pred
+        return img_mask_pred
+
+
 class SmokeModel(pl.LightningModule):
-    def __init__(self, arch, encoder_name, activation,
-                 loss_fn, classes,
-                 in_channels=3, start_learning_rate=1e-3,
+    def __init__(self, arch, encoder_name, activation, classes,
+                 weights=None, loss_fn=None, in_channels=3, start_learning_rate=1e-3,
                  **kwargs):
         super().__init__()
         self.save_hyperparameters()  # for logging
@@ -152,11 +215,20 @@ class SmokeModel(pl.LightningModule):
             **kwargs
         )
 
-        # preprocessing parameteres for image
-        params = smp.encoders.get_preprocessing_params(encoder_name)
+        if weights is not None:
+            ckpt = torch.load(weights, map_location="cpu")
+            state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+            prefix = 'model.'
+            ckpt = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
+            self.model.load_state_dict(ckpt, strict=False)
 
-        self.register_buffer("mean", torch.tensor(params["mean"]).view(1, in_channels, 1, 1))
-        self.register_buffer("std", torch.tensor(params["std"]).view(1, in_channels, 1, 1))
+        # preprocessing parameteres for image
+        # params = smp.encoders.get_preprocessing_params(encoder_name)
+        # self.register_buffer("mean", torch.tensor(params["mean"]).view(1, in_channels, 1, 1))
+        # self.register_buffer("std", torch.tensor(params["std"]).view(1, in_channels, 1, 1))
+
+        self.register_buffer("mean", torch.tensor([0.5, 0.5, 0.5]).view(1, in_channels, 1, 1))
+        self.register_buffer("std", torch.tensor([0.5, 0.5, 0.5]).view(1, in_channels, 1, 1))
 
         self.loss_fn = loss_fn
         self.start_learning_rate = start_learning_rate
@@ -165,6 +237,7 @@ class SmokeModel(pl.LightningModule):
         # normalize image here
         image = (image - self.mean) / self.std  # need this?
         # TODO: compare blob with opencv blob
+        # print(168, image.shape, (torch.min(image).item(), torch.max(image).item()), image)
         pred = self.model(image)
         return pred
 
@@ -178,7 +251,7 @@ class SmokeModel(pl.LightningModule):
         #     optimizer, mode='min', verbose=True,
         #     factor=0.5, patience=15, cooldown=5, min_lr=1e-5, eps=1e-7,
         # )
-        major_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+        major_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.5)
 
         return {"optimizer": optimizer, "lr_scheduler": major_scheduler, "monitor": 'loss/validation'}
         # return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": 'loss/validation'}
@@ -208,11 +281,17 @@ class SmokeModel(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         return self._shared_step(batch, stage='test')
 
+    def predict_step(self, batch, batch_idx):
+        imgs = batch  # Inference Dataset only!
+        preds = self.forward(imgs)
+        return preds
+
     def save_onnx_best(self, weights, window_size, onnx_path, need_sigmoid_activation=True, dynamic_batch=True):
         weights = torch.load(weights, map_location="cpu")
         self.load_state_dict(weights['state_dict'])
         if need_sigmoid_activation:  # logits to probs
             self.model.segmentation_head[-1].activation = torch.nn.Sigmoid()
+        self.model.to("cpu")
 
         input_width, input_height = window_size  # w,h format
         x = torch.randn(1, 3, input_height, input_width, requires_grad=True)
@@ -389,6 +468,7 @@ class MetricSMPCallback(Callback):
             for cl_name, m_val in m_vals.items():
                 trainer.model.log(f'{m_name}/{stage}_{cl_name}', m_val, on_step=False, on_epoch=True)
 
+        # if stage in ['train'] and batch_idx in [0]:
         if stage in ['validation'] and batch_idx in self.batches_check_validation or \
                 stage in ['train'] and batch_idx in self.batches_check_train:
 
@@ -408,6 +488,7 @@ class MetricSMPCallback(Callback):
             img_for_show = max_show_img_size_reshape(img_for_show, max_show_img_size=(1400, 1400)).astype(np.uint8)
             # TODO: metrics for batch, not for current img!!!
             img_for_show = self._cv2_add_title(img_for_show, title)
+            # plt_show_img(img_for_show)
 
             if self.save_img and save_path:
                 cv2.imwrite(str(save_path), cv2.cvtColor(img_for_show, cv2.COLOR_BGR2RGB))

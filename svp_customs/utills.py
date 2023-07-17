@@ -48,10 +48,11 @@ def plt_show_img(img,
                  save_path: Union[str, Path] = None) -> None:
     if isinstance(img, (str, Path)):
         img = cv2.imread(str(img))
+    img = img.astype(np.uint8)
     img_show = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if mode == 'plt' else img
     if coef:
         img_show = img_show * coef
-    img_show = img_show.copy().astype(int)
+    img_show = img_show.copy().astype(np.uint8)
     title = str(title) if title is not None else 'image'
     if mode == 'plt':
         fig = plt.figure()
