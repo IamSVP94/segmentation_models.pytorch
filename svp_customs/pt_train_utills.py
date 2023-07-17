@@ -172,19 +172,8 @@ class InferenceSmokeDataset(BaseDataset):
         if self.preprocessing:
             sample = self.preprocessing(image=image)
             image = sample['image']
-        # return {'image': image, 'path': img_path}
         return image
 
-    # @staticmethod
-    #     def _get_preds_after_threshold(preds, threshold):
-    #         preds_thr = []
-    #         for cl in range(preds.shape[-3]):  # skip h,w from tail
-    #             if len(preds.shape) == 3:
-    #                 ch_preds = torch.where(preds[cl, :, :] >= threshold[cl], 1, 0)
-    #             elif len(preds.shape) == 4:
-    #                 ch_preds = torch.where(preds[:, cl, :, :] >= threshold[cl], 1, 0)
-    #             preds_thr.append(ch_preds)
-    #         return torch.stack(preds_thr, dim=-3)
     @staticmethod
     def draw_mask(img, mask, colors=get_random_colors(3), thresholds=None):
         if thresholds:
@@ -237,7 +226,6 @@ class SmokeModel(pl.LightningModule):
         # normalize image here
         image = (image - self.mean) / self.std  # need this?
         # TODO: compare blob with opencv blob
-        # print(168, image.shape, (torch.min(image).item(), torch.max(image).item()), image)
         pred = self.model(image)
         return pred
 

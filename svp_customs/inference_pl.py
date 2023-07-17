@@ -1,19 +1,15 @@
-from pathlib import Path
-
-import albumentations as albu
 import cv2
-import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader
 from tqdm import tqdm
-
+from pathlib import Path
+import albumentations as albu
+import pytorch_lightning as pl
+from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
-from svp_customs.pt_train_utills import InferenceSmokeDataset, SmokeModel, MetricSMPCallback
 from svp_customs.utills import plt_show_img
+from svp_customs.pt_train_utills import InferenceSmokeDataset, SmokeModel
 
 pl.seed_everything(2)
-
-EXPERIMENT_NAME = 'FPN_inceptionv4'
 
 arch = 'FPN'
 ENCODER = 'inceptionv4'
@@ -42,7 +38,8 @@ def get_preprocessing(preprocessing_fn):
 preprocessing_fn = smp.encoders.get_preprocessing_fn('inceptionv4', 'imagenet')  # fix std, mean = [0.5,0.5,0.5]
 
 inference_dir = Path('/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST_DATASET/')
-new_save_dir = inference_dir.parent / f'{inference_dir.stem}_ready_thresholds/'
+new_save_dir = inference_dir.parent / f'{inference_dir.stem}_torch_ready/'
+thresholds = None
 
 weights = '/home/vid/hdd/projects/PycharmProjects/segmentation_models.pytorch_iamsvp94/svp_customs/lightning_logs/FPN_inceptionv4_FPN_inceptionv4_model/version_4/checkpoints/epoch=125-iou_validation_total=0.6804.ckpt'
 model = SmokeModel(
@@ -69,6 +66,6 @@ for img_path, pred in tqdm(zip(inference_dataset.imgs, preds), total=len(inferen
     image = cv2.imread(str(img_path))
     if image.shape[:2] != (input_height, input_width):
         image = cv2.resize(image, (input_width, input_height), interpolation=cv2.INTER_NEAREST)
-    with_mask = InferenceSmokeDataset.draw_mask(image, pred, colors=colors, thresholds=[0.5, 0.5])
+    with_mask = InferenceSmokeDataset.draw_mask(image, pred, colors=colors, thresholds=thresholds)
     with_mask_path = new_save_dir / img_path.name
     cv2.imwrite(str(with_mask_path), with_mask)

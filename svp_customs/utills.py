@@ -6,7 +6,6 @@ from typing import Tuple, Union, List
 import cv2
 import numpy as np
 from matplotlib import pyplot as plt
-
 from svp_customs.constants import OPENCV_CONFIG
 
 
