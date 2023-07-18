@@ -8,7 +8,7 @@ OPENCV_CONFIG = {
     'image_spatial_size': (1920, 1088),
     'fp16': True,  # inference
     'image_mean_subtraction': [127.5, 127.5, 127.5],
-    'blob_normalization_scale': 1.0,
+    'blob_normalization_scale': 2.0,  # because in torch 0.5
     'blob_mean_subtraction': [0, 0, 0],
     'blob_standard_deviation': [0.5, 0.5, 0.5],
     'swapRB': True,

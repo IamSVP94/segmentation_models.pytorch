@@ -12,8 +12,8 @@ from svp_customs.pt_train_utills import CustomSmokeDataset, SmokeModel, MetricSM
 
 pl.seed_everything(2)
 
-EXPERIMENT_NAME = 'FPN_inceptionv4'
-MODEL_VERSION = 'R10'
+EXPERIMENT_NAME = 'FPN_inceptionv4_smoke_cat_2_to_1_copy'
+MODEL_VERSION = 'R10.1'
 
 task = Task.init(
     project_name='143-NLMK-DCA_Theme4Dim',
@@ -22,15 +22,16 @@ task = Task.init(
 )
 
 # TODO: resize before train
-train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TRAIN_DATASET/'
-val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/VAL_DATASET/'
+# TODO: add img mask cache
+train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/another_dataset/TRAIN_DATASET_v2/'
+val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/another_dataset/VAL_DATASET_v2/'
+# train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/another_dataset/TRAIN_DATASET_v3/'
+# val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/another_dataset/TRAIN_DATASET_v3/'
 test_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST_DATASET/'
 
 # TODO: add yaml configurator
 arch = 'FPN'
 ENCODER = 'inceptionv4'
-# arch = 'UnetPlusPlus'
-# ENCODER = 'resnet34'
 
 ENCODER_WEIGHTS = 'imagenet'
 CLASSES = ['smoke_cat_1', 'smoke_cat_2']  # 2 classes + 1 background
@@ -196,15 +197,12 @@ best_iou_saver = ModelCheckpoint(
 )
 
 trainer = pl.Trainer(
-    max_epochs=300,
-    accelerator='cuda',
-    devices=-1,
-    num_sanity_val_steps=0,
-    logger=tb_logger,
-    callbacks=[lr_monitor, metrics_callback, best_iou_saver],
+    max_epochs=300, num_sanity_val_steps=0,
+    accelerator='cuda', devices=-1,
+    logger=tb_logger, callbacks=[lr_monitor, metrics_callback, best_iou_saver],
 )
 
-weights = '/home/vid/hdd/projects/PycharmProjects/segmentation_models.pytorch_iamsvp94/svp_customs/lightning_logs/FPN_inceptionv4_FPN_inceptionv4_model/version_3/checkpoints/epoch=epoch=61-iou_validation=iou/validation_total=0.6657.ckpt'
+weights = None
 
 trainer.fit(
     model=model,

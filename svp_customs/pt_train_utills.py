@@ -48,26 +48,28 @@ class CustomSmokeDataset(BaseDataset):
         return len(self.imgs)
 
     @staticmethod
-    def draw_mask(img, mask, threshhold=0.1, mode='cv2'):
-        colors = [
-            (0, 0, 255),
-            (0, 255, 0),
-            (255, 0, 0),
-        ]
+    def draw_mask(img, mask, colors=get_random_colors(100), thresholds=None, show_mode=None):
+        if thresholds:
+            preds_thr = []
+            chs = []
+            for cl in range(mask.shape[-1]):
+                bool_class_mask = np.where(mask[:, :, cl] > thresholds[cl], 1, 0)
+                if thresholds and np.sum(bool_class_mask):
+                    chs.append(cl)
+                preds_thr.append(bool_class_mask)
+            mask = np.stack(preds_thr).transpose(1, 2, 0)
 
-        # empty_image = np.zeros(img.shape)
-        img_mask = img.copy()
-        chs = []
-        for ch in range(mask.shape[-1]):
-            bool_class_mask = np.where(mask[:, :, ch] > threshhold)
-            if len(bool_class_mask[0]) > 0:
-                chs.append(ch)
-                # empty_image[bool_class_mask] = colors[ch]
-                img_mask[bool_class_mask] = colors[ch]
-        img_mask = cv2.cvtColor(img_mask.astype(np.uint8), cv2.COLOR_BGR2RGB)
-        # empty_image = cv2.cvtColor(empty_image.astype(np.uint8), cv2.COLOR_BGR2RGB)
-        # plt_show_img(img_mask, title=f'detected classes: {chs}', mode=mode)
-        # plt_show_img(empty_image)
+        img_mask_pred = img.copy()
+        for ch_idx in range(mask.shape[-1]):
+            ch_pred = mask[:, :, ch_idx]
+            confidences_pred = np.stack((ch_pred, ch_pred, ch_pred)).transpose(1, 2, 0)
+            full_color = np.full(shape=confidences_pred.shape, fill_value=colors[ch_idx][::-1])
+            img_mask_pred = img_mask_pred * (1.0 - confidences_pred) + full_color * confidences_pred
+        img_mask_pred = img_mask_pred.astype(np.uint8)
+        if show_mode:
+            title = f'detected classes: {chs}' if thresholds else ''
+            plt_show_img(cv2.cvtColor(img_mask_pred, cv2.COLOR_BGR2RGB), title=title, mode=show_mode)
+        return img_mask_pred
 
     def __getitem__(self, item):
         img_path, mask_path = self.imgs[item], self.masks[item]
@@ -98,7 +100,8 @@ class CustomSmokeDataset(BaseDataset):
             sample = self.augmentation(image=image, mask=mask)
             image, mask = sample['image'], sample['mask']
 
-        # self.draw_mask(image, mask, mode='plt')  # for augmentation demonstration
+        # colors = [(0, 0, 255), (0, 255, 0)]
+        # self.draw_mask(image, mask, thresholds=[0.5, 0.5], colors=[color[::-1] for color in colors], show_mode='plt')
         # exit()
 
         # apply preprocessing
@@ -111,29 +114,15 @@ class CustomSmokeDataset(BaseDataset):
         with open(json_path, 'r') as label_json:
             json_txt = json.load(label_json)
         orig_h, orig_w = json_txt["imageHeight"], json_txt["imageWidth"]
-        labels = json_txt["shapes"]
-        mask = np.zeros((orig_h, orig_w, len(self.classes)), dtype=np.uint8)
-
-        for l in labels:
-            class_index = self.classes.index(l["label"])
-            points = l["points"]
-
-            if l["shape_type"] in ["polygon", "linestrip"]:
-                color = [0] * len(self.classes)
-                color[class_index] = 1
-
-                contour = [np.array(points, dtype=np.int32)]
-                cv2.drawContours(
-                    image=mask,
-                    contours=[contour[0]],
-                    contourIdx=0,
-                    color=color,
-                    thickness=-1)
-            elif l["shape_type"] in ["rectangle"]:
-                cv2.rectangle(mask,
-                              (int(points[0][0]), int(points[0][1])),
-                              (int(points[1][0]), int(points[1][1])),
-                              color, -1)
+        points = {cl: [np.int32(l["points"]) for l in json_txt["shapes"] if l['label'] == cl] for cl in self.classes}
+        mask = dict()
+        for cl_name, cl_points in points.items():
+            idx = self.classes.index(cl_name)
+            cl_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+            cv2.fillPoly(img=cl_mask, pts=cl_points, color=1, lineType=cv2.LINE_AA)
+            mask[idx] = cl_mask
+        sorted_cl = [val for _, val in sorted(mask.items())]
+        mask = np.array(sorted_cl).transpose(1, 2, 0)
         if mask.shape[:2] != self.input_size[::-1]:
             mask = cv2.resize(mask, self.input_size, interpolation=cv2.INTER_NEAREST)
         return mask
@@ -189,7 +178,7 @@ class InferenceSmokeDataset(BaseDataset):
             confidences_pred = np.stack((ch_pred, ch_pred, ch_pred)).transpose(1, 2, 0)
             full_color = np.full(shape=confidences_pred.shape, fill_value=colors[ch_idx][::-1])
             img_mask_pred = img_mask_pred * (1.0 - confidences_pred) + full_color * confidences_pred
-        return img_mask_pred
+        return img_mask_pred.astype(np.uint8)
 
 
 class SmokeModel(pl.LightningModule):
@@ -414,7 +403,7 @@ class MetricSMPCallback(Callback):
         final_img = torch.cat([orig_gt_concat, pred_pred_th_concat], dim=1)  # concat by h
         final_img = torch.permute(final_img, (1, 2, 0))
         if to_numpy:
-            final_img = final_img.cpu().detach().numpy()
+            final_img = final_img.cpu().detach().numpy().astype(np.uint8)
         return final_img
 
     @staticmethod
