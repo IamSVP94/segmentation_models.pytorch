@@ -12,22 +12,15 @@ from svp_customs.pt_train_utills import CustomSmokeDataset, SmokeModel, MetricSM
 
 pl.seed_everything(2)
 
-EXPERIMENT_NAME = 'FPN_inceptionv4_smoke_cat_2_to_1_copy'
-MODEL_VERSION = 'R10.1'
-
-task = Task.init(
-    project_name='143-NLMK-DCA_Theme4Dim',
-    task_name=EXPERIMENT_NAME,
-    tags=['segmentation', 'Smoke_segmentation', 'pl', MODEL_VERSION, 'self_augmentation_v2'],
-)
+EXPERIMENT_NAME = 'FPN_inceptionv4_augmentation_v1_with_normalize'
+MODEL_VERSION = 'R10.2'
+weights = None
 
 # TODO: resize before train
 # TODO: add img mask cache
-train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/another_dataset/TRAIN_DATASET_v2/'
-val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/another_dataset/VAL_DATASET_v2/'
-# train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/another_dataset/TRAIN_DATASET_v3/'
-# val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/another_dataset/TRAIN_DATASET_v3/'
-test_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST_DATASET/'
+train_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TRAIN/'
+val_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/VAL/'
+test_dir = '/home/vid/hdd/file/project/143-NLMK-DCA/Theme4Dim/labelmedataset/TEST/'
 
 # TODO: add yaml configurator
 arch = 'FPN'
@@ -39,11 +32,9 @@ colors = [(0, 0, 255), (0, 255, 0)]
 
 ACTIVATION = None
 
-# input_width, input_height = 1920, 1088
 input_width, input_height = 1280, 736
-# input_width, input_height = 512, 288
 
-'''
+# '''
 train_transform = [
     albu.HorizontalFlip(p=0.5),
     albu.ShiftScaleRotate(scale_limit=0.5, rotate_limit=0, shift_limit=0.1, p=1, border_mode=0),
@@ -78,9 +69,9 @@ train_transform = [
         p=0.9,
     ),
 ]
-'''
-
 # '''
+
+'''
 train_transform = [
     albu.HorizontalFlip(p=0.5),
     albu.ShiftScaleRotate(scale_limit=0.5, rotate_limit=0, shift_limit=0.1, p=1, border_mode=cv2.BORDER_REFLECT_101),
@@ -109,9 +100,13 @@ train_transform = [
     ),
     albu.HueSaturationValue(p=0.5, hue_shift_limit=0, sat_shift_limit=30, val_shift_limit=20, ),
 ]
-
-
 # '''
+
+task = Task.init(
+    project_name='143-NLMK-DCA_Theme4Dim/smoke_segmentation',
+    task_name=EXPERIMENT_NAME,
+    tags=['segmentation', MODEL_VERSION, 'augmentation_v2', arch, ENCODER],
+)
 
 
 def to_tensor(x, **kwargs):
@@ -127,8 +122,8 @@ def get_preprocessing(preprocessing_fn):
 
 
 # TODO: write fix preprocessing for easy subsequent using with ONNX
+# mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 preprocessing_fn = smp.encoders.get_preprocessing_fn('inceptionv4', 'imagenet')  # fix std, mean = [0.5,0.5,0.5]
-# preprocessing_fn = smp.encoders.get_preprocessing_fn(ENCODER, ENCODER_WEIGHTS)
 
 train_dataset = CustomSmokeDataset(
     dataset_dir=train_dir, input_width=input_width, input_height=input_height,
@@ -138,6 +133,11 @@ train_dataset = CustomSmokeDataset(
 
 val_dataset = CustomSmokeDataset(
     dataset_dir=val_dir, input_width=input_width, input_height=input_height,
+    classes=CLASSES, preprocessing=get_preprocessing(preprocessing_fn),
+)
+
+test_dataset = CustomSmokeDataset(
+    dataset_dir=test_dir, input_width=input_width, input_height=input_height,
     classes=CLASSES, preprocessing=get_preprocessing(preprocessing_fn),
 )
 
@@ -161,10 +161,8 @@ metrics_callback = MetricSMPCallback(
     },
     threshold=[0.5, 0.5], reduction='macro', classes_separately=True,
     activation='sigmoid', mode=mode, colors=colors,
-    n_img_check_per_epoch_validation=10,
-    n_img_check_per_epoch_train=2,
-    n_img_check_per_epoch_save=True,
-    log_img=False, save_img=True,
+    n_img_check_per_epoch_validation=2, n_img_check_per_epoch_train=10,
+    n_img_check_per_epoch_save=True, log_img=True, save_img=True,
 )
 
 start_learning_rate = 1e-3
@@ -176,13 +174,12 @@ start_learning_rate = 1e-3
 # scheduler_steplr = torch.optim.lr_scheduler.MultiStepLR(optimizer, gamma=0.5, milestones=scheduler_steps, verbose=True)
 # scheduler_warmup = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=10, after_scheduler=scheduler_steplr)
 
-# TODO: add scheduler in SmokeModel
+# TODO: add scheduler in SmokeModel args
 model = SmokeModel(
     arch=arch,
     encoder_name=ENCODER,
     activation=ACTIVATION,
     loss_fn=criterion,
-    in_channels=3,  # RGB
     classes=CLASSES,
     start_learning_rate=start_learning_rate,
 )
@@ -191,18 +188,16 @@ tb_logger = TensorBoardLogger('lightning_logs', name=f'{arch}_{ENCODER}_{EXPERIM
 lr_monitor = LearningRateMonitor(logging_interval='epoch')
 best_iou_saver = ModelCheckpoint(
     monitor='iou/validation_total',
-    mode='max', save_top_k=1, save_last=True,
+    mode='max', save_top_k=2, save_last=True,
     filename='epoch={epoch:02d}-iou_validation_total={iou/validation_total:.4f}',
     auto_insert_metric_name=False,
 )
 
 trainer = pl.Trainer(
-    max_epochs=300, num_sanity_val_steps=0,
+    max_epochs=200, num_sanity_val_steps=0,
     accelerator='cuda', devices=-1,
     logger=tb_logger, callbacks=[lr_monitor, metrics_callback, best_iou_saver],
 )
-
-weights = None
 
 trainer.fit(
     model=model,
@@ -211,18 +206,15 @@ trainer.fit(
     ckpt_path=weights,
 )
 
-test_dataset = CustomSmokeDataset(
-    dataset_dir=test_dir, input_width=input_width, input_height=input_height,
-    classes=CLASSES, preprocessing=get_preprocessing(preprocessing_fn),
-)
 test_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=15)
-test_metrics = trainer.test(model, dataloaders=test_loader, ckpt_path=best_iou_saver.best_model_path, verbose=True)
+test_metrics = trainer.test(model, dataloaders=test_loader, ckpt_path='best', verbose=True)  # ckpt_path='last'
 
 logger_weights_dir = Path(best_iou_saver.best_model_path).parent.parent
 ONNX_PATH = logger_weights_dir / f'{arch}_{ENCODER}_{MODEL_VERSION}_{input_width}x{input_height}.onnx'
 
+# TODO: change to current logdir onnx path because rewriting?
 model.save_onnx_best(
-    weights=best_iou_saver.best_model_path,
+    weights=best_iou_saver.best_model_path,  # best_iou_saver.last_model_path
     window_size=(input_width, input_height),
     onnx_path=ONNX_PATH,
 )

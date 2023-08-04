@@ -1,5 +1,6 @@
 import json
 import random
+from datetime import datetime
 from pathlib import Path
 
 import albumentations as albu
@@ -7,12 +8,80 @@ import cv2
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from matplotlib import pyplot as plt
+from shapely.geometry import Polygon
 from pytorch_lightning import Callback
 from torch.utils.data import Dataset as BaseDataset
 
 import segmentation_models_pytorch as smp
 from segmentation_models_pytorch.base.modules import Activation
 from svp_customs.utills import glob_search, plt_show_img, get_random_colors, max_show_img_size_reshape
+
+
+def square_from_points(points):
+    pgon = Polygon(points)
+    return pgon.area
+
+
+def _labelbar(ax, rects, opacity=0.5, labels=None, h_coef=1.0):
+    for idx, rect in enumerate(rects):
+        h, w = rect.get_height(), rect.get_width()
+        if labels is None:
+            label = f'{h}'
+        else:
+            label = labels[idx]
+        ax.text(rect.get_x() + w / 2., h * h_coef, label, ha='center', va='bottom', alpha=opacity)
+
+
+def get_datetime(str_time):
+    try:
+        datetime_object = datetime.strptime(str_time, '%Y-%m-%d %H:%M:%S.%f')
+    except ValueError:
+        try:
+            datetime_object = datetime.strptime(str_time, '%Y-%m-%d %H:%M:%S')
+        except ValueError as e:
+            print(str_time)
+            print(e)
+            exit()
+    return datetime_object
+
+
+def get_cl_by_h_distrib(ax, classes, distribution, add_date_counter_label=False, labelbar=False, opacity=0.5):
+    cl_by_h = {n: {h: 0 for h in range(24)} for n in classes}
+    cl_by_h_days = {n: {h: list() for h in range(24)} for n in classes}
+    for cl_name, distrib in distribution.items():
+        for el in distrib:
+            for date, square_val in el.items():
+                datetime_object = get_datetime(date)
+                cl_by_h[cl_name][datetime_object.hour] += square_val
+                cl_by_h_days[cl_name][datetime_object.hour].append(datetime_object.date())
+    else:
+        for cl_name, h_distrib in cl_by_h.items():
+            if add_date_counter_label:
+                # how many dates in dataset
+                labels = {h: f'{len(set(days))} ({len(days)})' if days else 0 for h, days in
+                          cl_by_h_days[cl_name].items()}
+            else:
+                labels = None
+            bar_size = ax.bar(h_distrib.keys(), list(map(int, h_distrib.values())), alpha=opacity, label=cl_name, )
+            if labelbar:
+                _labelbar(ax, bar_size, opacity, labels=labels)
+    return cl_by_h
+
+
+def get_cl_by_dataset_distrib(ax, classes, distribution, labelbar=False, opacity=0.5):
+    cl_by_dataset = {n: 0 for n in classes}
+    cl_img_counter = dict()
+    for cl, distrib in distribution.items():
+        for img_info in distrib:
+            for date, square in img_info.items():
+                cl_by_dataset[cl] += square
+        cl_img_counter[cl] = len(distrib)
+    for cl_name, square in cl_by_dataset.items():
+        bar_size = ax.bar(f'{cl_img_counter[cl_name]} images total', int(square), alpha=opacity, label=cl_name)
+        if labelbar:
+            _labelbar(ax, bar_size, opacity)
+    return cl_by_dataset
 
 
 class CustomSmokeDataset(BaseDataset):
@@ -24,16 +93,39 @@ class CustomSmokeDataset(BaseDataset):
             classes=None,
             augmentation=None,
             preprocessing=None,
+            show_dataset_info=True,
     ):
         self.imgs = glob_search(dataset_dir, sort=True, exception_if_empty=True)
         self.masks = []
+
+        if show_dataset_info:
+            dataset_cl_counts = {cl: [] for cl in classes}
+            fig, (ax_h, ax_d) = plt.subplots(ncols=2, tight_layout=True, figsize=(10, 10), )
         for img_idx, img_path in enumerate(self.imgs):
             json_path = img_path.with_suffix('.json')
             if json_path.exists():
                 self.masks.append(json_path)
+
+                if show_dataset_info:
+                    with open(json_path, 'r') as rf:
+                        j = json.load(rf)
+                        shapes = j['shapes']
+                        for s in shapes:
+                            dataset_cl_counts[s['label']].append({json_path.stem: square_from_points(s['points'])})
             else:
                 self.imgs.remove(img_path)  # del img from list if maskfile.json does'n exist
                 print(f'{str(json_path)} does not exist!')
+
+        if show_dataset_info:
+            get_cl_by_h_distrib(ax_h, classes, dataset_cl_counts, add_date_counter_label=True, labelbar=True)
+            ax_h.set_title(f'Пплощади классов в px по времени суток')
+            ax_h.set_xticks(range(24))
+            ax_h.legend()
+
+            get_cl_by_dataset_distrib(ax_d, classes, dataset_cl_counts, labelbar=True)
+            ax_d.set_title(f'Площади классов в px по выборке датасета')
+            ax_d.legend()
+            fig.show()
 
         self.input_size = (input_width, input_height)
 
@@ -213,8 +305,7 @@ class SmokeModel(pl.LightningModule):
 
     def forward(self, image):
         # normalize image here
-        image = (image - self.mean) / self.std  # need this?
-        # TODO: compare blob with opencv blob
+        image = (image - self.mean) / self.std  # not need this for same result
         pred = self.model(image)
         return pred
 
@@ -448,6 +539,7 @@ class MetricSMPCallback(Callback):
         # if stage in ['train'] and batch_idx in [0]:
         if stage in ['validation'] and batch_idx in self.batches_check_validation or \
                 stage in ['train'] and batch_idx in self.batches_check_train:
+            # TODO: save worse results by metrics?
 
             save_path = None
             if self.n_img_check_per_epoch_save:
@@ -465,7 +557,6 @@ class MetricSMPCallback(Callback):
             img_for_show = max_show_img_size_reshape(img_for_show, max_show_img_size=(1400, 1400)).astype(np.uint8)
             # TODO: metrics for batch, not for current img!!!
             img_for_show = self._cv2_add_title(img_for_show, title)
-            # plt_show_img(img_for_show)
 
             if self.save_img and save_path:
                 cv2.imwrite(str(save_path), cv2.cvtColor(img_for_show, cv2.COLOR_BGR2RGB))
